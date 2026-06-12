@@ -363,39 +363,40 @@ def _parse_one_sample_part_boxes(elem: Any, parts_in_file: List[str]) -> np.ndar
 
 
 def _load_gdino_part_boxes_tensor(gd: Dict[str, Any], parts_in_file: List[str]) -> torch.Tensor:
+    """Load GDINO boxes while preserving the per-part box-slot dimension.
+
+    Returns:
+        Tensor with shape (N, P, M, 4). Legacy (N, P, 4) inputs are promoted
+        to M=1. This is required to keep the two wing boxes separate.
+    """
     pb = gd["part_boxes_xyxy_pix"]
     p_need = len(parts_in_file)
 
     if isinstance(pb, torch.Tensor):
         pb = pb.float()
+
         if pb.ndim == 3 and pb.shape[-1] == 4:
-            out = torch.full((pb.shape[0], p_need, 4), -1.0, dtype=torch.float32)
+            pb = pb.unsqueeze(2)  # (N,P,1,4)
+
+        if pb.ndim == 4 and pb.shape[-1] == 4:
+            out = torch.full(
+                (pb.shape[0], p_need, pb.shape[2], 4),
+                -1.0,
+                dtype=torch.float32,
+            )
             m = min(p_need, pb.shape[1])
             out[:, :m] = pb[:, :m]
             return out
 
-        if pb.ndim == 4 and pb.shape[-1] == 4:
-            b = pb.reshape(pb.shape[0], pb.shape[1], -1, 4)
-            valid = (b[..., 0] >= 0) & (b[..., 2] > b[..., 0]) & (b[..., 3] > b[..., 1])
-            big = torch.tensor(1e9, dtype=torch.float32)
-            neg = torch.tensor(-1e9, dtype=torch.float32)
-            x1 = torch.where(valid, b[..., 0], big).min(dim=2).values
-            y1 = torch.where(valid, b[..., 1], big).min(dim=2).values
-            x2 = torch.where(valid, b[..., 2], neg).max(dim=2).values
-            y2 = torch.where(valid, b[..., 3], neg).max(dim=2).values
-            any_valid = valid.any(dim=2)
-            merged = torch.stack([x1, y1, x2, y2], dim=-1)
-            merged[~any_valid] = -1.0
-            out = torch.full((pb.shape[0], p_need, 4), -1.0, dtype=torch.float32)
-            m = min(p_need, merged.shape[1])
-            out[:, :m] = merged[:, :m]
-            return out
         raise ValueError(f"Unexpected part box tensor shape: {tuple(pb.shape)}")
 
     if isinstance(pb, (list, tuple)):
-        out = torch.full((len(pb), p_need, 4), -1.0, dtype=torch.float32)
+        # Legacy list/dict caches contain one box per part.
+        out = torch.full((len(pb), p_need, 1, 4), -1.0, dtype=torch.float32)
         for i, elem in enumerate(pb):
-            out[i] = torch.from_numpy(_parse_one_sample_part_boxes(elem, parts_in_file))
+            out[i, :, 0] = torch.from_numpy(
+                _parse_one_sample_part_boxes(elem, parts_in_file)
+            )
         return out
 
     raise TypeError(f"Unsupported part_boxes_xyxy_pix container: {type(pb)}")
@@ -434,7 +435,7 @@ class CUBCachedDINOWithBoxes(Dataset):
         else:
             parts_in_file = ["beak", "head", "wing", "body", "tail", "feet"]
 
-        boxes_pf = _load_gdino_part_boxes_tensor(gd, parts_in_file)
+        boxes_pf = _load_gdino_part_boxes_tensor(gd, parts_in_file)  # (Ng,Pf,M,4)
         gd_relpaths = [str(x) for x in gd["relpaths"]]
         gd_index = {rp: i for i, rp in enumerate(gd_relpaths)}
 
@@ -448,34 +449,55 @@ class CUBCachedDINOWithBoxes(Dataset):
                 return [i for i, n in enumerate(parts_in_file) if "feet" in n or "foot" in n or "leg" in n]
             return [i for i, n in enumerate(parts_in_file) if n == t]
 
-        merged_src = torch.full((boxes_pf.shape[0], len(cfg.PARTS), 4), -1.0, dtype=torch.float32)
-        for p, part_name in enumerate(cfg.PARTS):
-            indices = match_indices(part_name)
-            if not indices:
-                continue
-            bx = boxes_pf[:, indices, :]
-            valid = (bx[..., 0] >= 0) & (bx[..., 2] > bx[..., 0]) & (bx[..., 3] > bx[..., 1])
-            big = torch.tensor(1e9, dtype=torch.float32)
-            neg = torch.tensor(-1e9, dtype=torch.float32)
-            x1 = torch.where(valid, bx[..., 0], big).min(dim=1).values
-            y1 = torch.where(valid, bx[..., 1], big).min(dim=1).values
-            x2 = torch.where(valid, bx[..., 2], neg).max(dim=1).values
-            y2 = torch.where(valid, bx[..., 3], neg).max(dim=1).values
-            any_valid = valid.any(dim=1)
-            merged = torch.stack([x1, y1, x2, y2], dim=1)
-            merged[~any_valid] = -1.0
-            merged_src[:, p] = merged
+        max_boxes = int(boxes_pf.shape[2])
+        aligned_src = torch.full(
+            (boxes_pf.shape[0], len(cfg.PARTS), max_boxes, 4),
+            -1.0,
+            dtype=torch.float32,
+        )
 
-        merged_224 = merged_src * scale
-        self.boxes = torch.full((self.N, len(cfg.PARTS), 4), -1.0, dtype=torch.float32)
+        for target_p, part_name in enumerate(cfg.PARTS):
+            source_indices = match_indices(part_name)
+            if not source_indices:
+                continue
+
+            # The new cache has exactly one source entry per named part. For
+            # older alias-rich caches, gather valid boxes in source order and
+            # keep at most max_boxes slots.
+            candidates = boxes_pf[:, source_indices].reshape(
+                boxes_pf.shape[0], -1, 4
+            )
+            valid = (
+                (candidates[..., 0] >= 0)
+                & (candidates[..., 2] > candidates[..., 0])
+                & (candidates[..., 3] > candidates[..., 1])
+            )
+            for image_i in range(candidates.shape[0]):
+                selected = candidates[image_i][valid[image_i]][:max_boxes]
+                if selected.numel() > 0:
+                    aligned_src[image_i, target_p, : selected.shape[0]] = selected
+
+        valid_aligned = aligned_src[..., 0] >= 0
+        aligned_224 = aligned_src.clone()
+        aligned_224[valid_aligned] = aligned_src[valid_aligned] * scale
+
+        self.boxes = torch.full(
+            (self.N, len(cfg.PARTS), max_boxes, 4),
+            -1.0,
+            dtype=torch.float32,
+        )
         missing = 0
         for i, rp in enumerate(self.relpaths):
             j = gd_index.get(rp)
             if j is None:
                 missing += 1
             else:
-                self.boxes[i] = merged_224[j]
-        print(f"[{split}] GDINO aligned={self.N - missing}/{self.N}; missing={missing}")
+                self.boxes[i] = aligned_224[j]
+
+        print(
+            f"[{split}] GDINO aligned={self.N - missing}/{self.N}; "
+            f"missing={missing}; box_slots={max_boxes}"
+        )
 
     def __len__(self) -> int:
         return self.N
@@ -513,16 +535,31 @@ def boxes_to_soft_q(
     image_size: int,
     eps: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Convert one or more boxes per part to soft token targets.
+
+    Args:
+        boxes: (B,P,4) or (B,P,M,4), xyxy coordinates.
+
+    Multiple boxes for a part are rasterized independently and combined by a
+    pointwise maximum. Therefore two wing boxes remain two separated regions;
+    they are never replaced by one enclosing rectangle.
     """
-    boxes: (B,P,4) in xyxy pixel coordinates on image_size x image_size.
-    returns:
-      q_sem:   (B,P,N), normalized over N for valid boxes
-      valid_bp:(B,P) bool
-    """
-    bsz, parts, _ = boxes.shape
+    if boxes.ndim == 3 and boxes.shape[-1] == 4:
+        boxes = boxes.unsqueeze(2)
+    if boxes.ndim != 4 or boxes.shape[-1] != 4:
+        raise ValueError(
+            "Expected boxes with shape (B,P,4) or (B,P,M,4), "
+            f"got {tuple(boxes.shape)}"
+        )
+
+    bsz, parts, max_boxes, _ = boxes.shape
     device = boxes.device
-    ys = (torch.arange(h, device=device, dtype=torch.float32) + 0.5) * (float(image_size) / h)
-    xs = (torch.arange(w, device=device, dtype=torch.float32) + 0.5) * (float(image_size) / w)
+    ys = (torch.arange(h, device=device, dtype=torch.float32) + 0.5) * (
+        float(image_size) / h
+    )
+    xs = (torch.arange(w, device=device, dtype=torch.float32) + 0.5) * (
+        float(image_size) / w
+    )
     yy, xx = torch.meshgrid(ys, xs, indexing="ij")
 
     q = torch.zeros((bsz, parts, h, w), device=device, dtype=torch.float32)
@@ -530,37 +567,49 @@ def boxes_to_soft_q(
 
     for b in range(bsz):
         for p in range(parts):
-            x1, y1, x2, y2 = boxes[b, p]
-            if x1 < 0 or x2 <= x1 or y2 <= y1:
-                continue
+            combined = torch.zeros((h, w), device=device, dtype=torch.float32)
 
-            x1 = x1.clamp(0, image_size)
-            y1 = y1.clamp(0, image_size)
-            x2 = x2.clamp(0, image_size)
-            y2 = y2.clamp(0, image_size)
+            for m in range(max_boxes):
+                x1, y1, x2, y2 = boxes[b, p, m]
+                if x1 < 0 or x2 <= x1 or y2 <= y1:
+                    continue
 
-            mask = (xx >= x1) & (xx <= x2) & (yy >= y1) & (yy <= y2)
-            if not mask.any():
-                # Tiny box fallback: nearest patch center.
-                cx = 0.5 * (x1 + x2)
-                cy = 0.5 * (y1 + y2)
-                dist = (xx - cx).pow(2) + (yy - cy).pow(2)
-                flat_idx = int(dist.argmin().item())
-                mask = torch.zeros_like(mask)
-                mask.view(-1)[flat_idx] = True
+                x1 = x1.clamp(0, image_size)
+                y1 = y1.clamp(0, image_size)
+                x2 = x2.clamp(0, image_size)
+                y2 = y2.clamp(0, image_size)
 
-            if cfg.BOX_TARGET_GAUSSIAN:
-                cx = 0.5 * (x1 + x2)
-                cy = 0.5 * (y1 + y2)
-                sx = ((x2 - x1) * cfg.BOX_GAUSSIAN_SIGMA_SCALE).clamp_min(float(image_size) / w)
-                sy = ((y2 - y1) * cfg.BOX_GAUSSIAN_SIGMA_SCALE).clamp_min(float(image_size) / h)
-                weight = torch.exp(-0.5 * (((xx - cx) / sx).pow(2) + ((yy - cy) / sy).pow(2)))
-                weight = weight * mask.float()
-            else:
-                weight = mask.float()
+                mask = (xx >= x1) & (xx <= x2) & (yy >= y1) & (yy <= y2)
+                if not mask.any():
+                    cx = 0.5 * (x1 + x2)
+                    cy = 0.5 * (y1 + y2)
+                    dist = (xx - cx).pow(2) + (yy - cy).pow(2)
+                    mask = torch.zeros_like(mask)
+                    mask.view(-1)[int(dist.argmin().item())] = True
 
-            if weight.sum() > 0:
-                q[b, p] = weight / weight.sum().clamp_min(eps)
+                if cfg.BOX_TARGET_GAUSSIAN:
+                    cx = 0.5 * (x1 + x2)
+                    cy = 0.5 * (y1 + y2)
+                    sx = (
+                        (x2 - x1) * cfg.BOX_GAUSSIAN_SIGMA_SCALE
+                    ).clamp_min(float(image_size) / w)
+                    sy = (
+                        (y2 - y1) * cfg.BOX_GAUSSIAN_SIGMA_SCALE
+                    ).clamp_min(float(image_size) / h)
+                    weight = torch.exp(
+                        -0.5
+                        * (
+                            ((xx - cx) / sx).pow(2)
+                            + ((yy - cy) / sy).pow(2)
+                        )
+                    ) * mask.float()
+                else:
+                    weight = mask.float()
+
+                combined = torch.maximum(combined, weight)
+
+            if combined.sum() > 0:
+                q[b, p] = combined / combined.sum().clamp_min(eps)
                 valid_bp[b, p] = True
 
     return q.flatten(2), valid_bp
