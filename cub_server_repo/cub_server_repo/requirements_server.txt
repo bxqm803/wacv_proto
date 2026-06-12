@@ -1,0 +1,7 @@
+numpy>=1.24
+pillow>=10.0
+tqdm>=4.66
+matplotlib>=3.7
+transformers>=4.40
+accelerate>=0.29
+safetensors>=0.4
