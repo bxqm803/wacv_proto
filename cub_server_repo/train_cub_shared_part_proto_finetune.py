@@ -62,27 +62,28 @@ class CFG:
     dino_model: str = "dinov2_vitb14"
     image_size: int = 224
     num_classes: int = 200
-    parts: Tuple[str, ...] = DEFAULT_PARTS
-    k_per_part: int = 50
+    parts: Tuple[str, ...] = ("head", "wing", "body", "tail")
+    k_per_part: int = 16
 
     # Light finetuning.
-    unfreeze_last_blocks: int = 2
+    unfreeze_last_blocks: int = 1
     unfreeze_norm: bool = True
-    freeze_backbone_epochs: int = 0
+    freeze_backbone_epochs: int = 5
 
     # Prototype scoring.
     # resp_sum: original responsibility-weighted evidence.
     # scan_max: full-image prototype scan max, no part-box mask.
     # scan_topk: average top-k full-image prototype responses.
-    score_mode: str = "resp_sum"
+    score_mode: str = "scan_max"
     scan_topk: int = 3
     tau_part: float = 0.20
     tau_proto: float = 0.05
     null_logit_init: float = 0.0
     residual_scale: float = 0.20
+    class_theta_init: float = -1.0
 
     # EMA memory update.
-    ema_rho: float = 0.95
+    ema_rho: float = 0.97
     ema_sem_mix: float = 0.50
     ema_min_mass: float = 1e-3
     ema_start_epoch: int = 1
@@ -95,20 +96,20 @@ class CFG:
     # Loss weights.
     label_smoothing: float = 0.0
     lambda_ce: float = 1.0
-    lambda_route: float = 1.0
-    route_final_ratio: float = 0.25
-    route_decay_epochs: int = 60
-    lambda_vis: float = 0.05
-    lambda_proto_lb: float = 0.02
-    lambda_proto_div: float = 0.02
+    lambda_route: float = 0.2
+    route_final_ratio: float = 0.1
+    route_decay_epochs: int = 20
+    lambda_vis: float = 0.01
+    lambda_proto_lb: float = 0.005
+    lambda_proto_div: float = 0.01
     proto_div_margin: float = 0.30
     lambda_cls_sparse: float = 1e-5
 
     # Optim.
-    lr_backbone: float = 1e-5
-    lr_router: float = 3e-5
-    lr_proto: float = 3e-5
-    lr_classifier: float = 1e-4
+    lr_backbone: float = 5e-6
+    lr_router: float = 1e-4
+    lr_proto: float = 1e-4
+    lr_classifier: float = 1e-3
     weight_decay: float = 1e-4
     grad_clip: float = 5.0
 
@@ -120,10 +121,12 @@ class CFG:
     amp: bool = True
     resume: bool = True
     resume_from: str = "last"  # last | best | none
+    reset_optimizer_on_resume: bool = False
+    resume_class_theta_min: Optional[float] = None
 
     # Semantic bootstrap.
     bootstrap_memory: bool = True
-    bootstrap_batches: int = 16
+    bootstrap_batches: int = 100
     bootstrap_max_tokens_per_part: int = 20000
     bootstrap_kmeans_iters: int = 20
 
@@ -454,7 +457,7 @@ class SharedPartPrototypeDINO(nn.Module):
         memory = l2n(torch.randn(parts, k, dim), dim=-1)
         self.register_buffer("memory", memory)
         self.proto_residual = nn.Parameter(torch.zeros(parts, k, dim))
-        self.class_theta = nn.Parameter(torch.full((classes, parts, k), -4.0))
+        self.class_theta = nn.Parameter(torch.full((classes, parts, k), float(cfg.class_theta_init)))
         self.class_bias = nn.Parameter(torch.zeros(classes))
 
     def extract_tokens(self, images: torch.Tensor) -> Tuple[torch.Tensor, int, int]:
@@ -791,9 +794,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ema-sem-mix", type=float, default=cfg.ema_sem_mix)
     p.add_argument("--ema-start-epoch", type=int, default=cfg.ema_start_epoch)
     p.add_argument("--residual-scale", type=float, default=cfg.residual_scale)
+    p.add_argument("--class-theta-init", type=float, default=cfg.class_theta_init)
+    p.add_argument("--lambda-route", type=float, default=cfg.lambda_route)
+    p.add_argument("--route-final-ratio", type=float, default=cfg.route_final_ratio)
+    p.add_argument("--route-decay-epochs", type=int, default=cfg.route_decay_epochs)
+    p.add_argument("--lambda-vis", type=float, default=cfg.lambda_vis)
+    p.add_argument("--lambda-proto-lb", type=float, default=cfg.lambda_proto_lb)
+    p.add_argument("--lambda-proto-div", type=float, default=cfg.lambda_proto_div)
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--no-resume", action="store_true")
     p.add_argument("--resume-from", choices=["last", "best", "none"], default=cfg.resume_from)
+    p.add_argument("--reset-optimizer-on-resume", action="store_true",
+                   help="Load model/best_acc from checkpoint but recreate optimizer/scaler so new LR/loss settings take effect.")
+    p.add_argument("--resume-class-theta-min", type=float, default=None,
+                   help="If set, clamp loaded class_theta to be at least this value, e.g. -1.0.")
     p.add_argument("--skip-bootstrap", action="store_true")
     p.add_argument("--bootstrap-batches", type=int, default=cfg.bootstrap_batches)
     p.add_argument("--no-scan-purity", action="store_true")
@@ -827,9 +841,18 @@ def apply_args(args: argparse.Namespace) -> None:
     cfg.ema_sem_mix = args.ema_sem_mix
     cfg.ema_start_epoch = args.ema_start_epoch
     cfg.residual_scale = args.residual_scale
+    cfg.class_theta_init = args.class_theta_init
+    cfg.lambda_route = args.lambda_route
+    cfg.route_final_ratio = args.route_final_ratio
+    cfg.route_decay_epochs = args.route_decay_epochs
+    cfg.lambda_vis = args.lambda_vis
+    cfg.lambda_proto_lb = args.lambda_proto_lb
+    cfg.lambda_proto_div = args.lambda_proto_div
     cfg.amp = not args.no_amp
     cfg.resume = not args.no_resume
     cfg.resume_from = args.resume_from
+    cfg.reset_optimizer_on_resume = args.reset_optimizer_on_resume
+    cfg.resume_class_theta_min = args.resume_class_theta_min
     cfg.bootstrap_memory = not args.skip_bootstrap
     cfg.bootstrap_batches = args.bootstrap_batches
     cfg.compute_scan_purity = not args.no_scan_purity
@@ -904,8 +927,15 @@ def main() -> None:
     if resume_path:
         ckpt = torch.load(resume_path, map_location="cpu")
         model.load_state_dict(ckpt["model"], strict=True)
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scaler.load_state_dict(ckpt.get("scaler", scaler.state_dict()))
+        if cfg.resume_class_theta_min is not None:
+            with torch.no_grad():
+                model.class_theta.data.clamp_min_(float(cfg.resume_class_theta_min))
+            print(f"[Resume] clamped class_theta >= {float(cfg.resume_class_theta_min):.3f}")
+        if not cfg.reset_optimizer_on_resume:
+            optimizer.load_state_dict(ckpt["optimizer"])
+            scaler.load_state_dict(ckpt.get("scaler", scaler.state_dict()))
+        else:
+            print("[Resume] reset optimizer/scaler; new CLI learning rates will be used")
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         best_acc = float(ckpt.get("best_acc", -1.0))
         print(f"[Resume] {resume_path} -> epoch {start_epoch}, best_acc={best_acc:.4f}")
@@ -987,6 +1017,19 @@ def main() -> None:
         record["best_acc"] = best_acc
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
+
+        status = {
+            "epoch": epoch,
+            "best_acc": best_acc,
+            "last_train_acc": float(train_metrics["acc"]),
+            "last_eval_acc": float(record["eval"]["acc"]) if "eval" in record else None,
+            "last_checkpoint": os.path.join(cfg.save_dir, "last.pth"),
+            "best_checkpoint": os.path.join(cfg.save_dir, "best.pth"),
+            "score_mode": cfg.score_mode,
+        }
+        with open(os.path.join(cfg.save_dir, "status.json"), "w", encoding="utf-8") as f:
+            json.dump(status, f, indent=2)
+
         if epoch % cfg.save_every == 0:
             save_checkpoint(os.path.join(cfg.save_dir, "last.pth"), model, optimizer, scaler, epoch, best_acc)
 
