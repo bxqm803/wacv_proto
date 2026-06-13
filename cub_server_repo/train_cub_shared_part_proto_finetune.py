@@ -66,21 +66,24 @@ class CFG:
     k_per_part: int = 16
 
     # Light finetuning.
-    unfreeze_last_blocks: int = 1
+    unfreeze_last_blocks: int = 2
     unfreeze_norm: bool = True
-    freeze_backbone_epochs: int = 5
+    freeze_backbone_epochs: int = 3
 
     # Prototype scoring.
     # resp_sum: original responsibility-weighted evidence.
     # scan_max: full-image prototype scan max, no part-box mask.
     # scan_topk: average top-k full-image prototype responses.
-    score_mode: str = "scan_max"
+    score_mode: str = "resp_sum"
+    # Important for resp_sum: part_map and proto softmax make evidence small.
+    # This only calibrates logit scale; it does not change evidence attribution.
+    score_scale: float = 20.0
     scan_topk: int = 3
     tau_part: float = 0.20
     tau_proto: float = 0.05
     null_logit_init: float = 0.0
     residual_scale: float = 0.20
-    class_theta_init: float = -1.0
+    class_theta_init: float = 0.0
 
     # EMA memory update.
     ema_rho: float = 0.97
@@ -106,10 +109,10 @@ class CFG:
     lambda_cls_sparse: float = 1e-5
 
     # Optim.
-    lr_backbone: float = 5e-6
-    lr_router: float = 1e-4
-    lr_proto: float = 1e-4
-    lr_classifier: float = 1e-3
+    lr_backbone: float = 1e-5
+    lr_router: float = 3e-4
+    lr_proto: float = 3e-4
+    lr_classifier: float = 1e-2
     weight_decay: float = 1e-4
     grad_clip: float = 5.0
 
@@ -135,6 +138,8 @@ class CFG:
     eval_every: int = 1
     save_every: int = 1
     compute_scan_purity: bool = True
+    log_train_debug: bool = True
+    debug_every: int = 50
 
     eps: float = 1e-9
 
@@ -210,6 +215,37 @@ def route_lambda(epoch: int) -> float:
 
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+def _finite_float(x: Any, default: float = 0.0) -> float:
+    """Convert scalar/tensor to a finite Python float for logging."""
+    try:
+        if isinstance(x, torch.Tensor):
+            x = x.detach().float()
+            if x.numel() == 0:
+                return default
+            val = float(x.mean().item())
+        else:
+            val = float(x)
+    except Exception:
+        return default
+    return val if math.isfinite(val) else default
+
+
+def add_weighted_stats(dst: Dict[str, float], stats: Dict[str, float], weight: int) -> None:
+    for k, v in stats.items():
+        val = _finite_float(v)
+        dst[k] = dst.get(k, 0.0) + val * int(weight)
+
+
+def grad_norm_of_tensors(params: Iterable[torch.Tensor]) -> float:
+    total = 0.0
+    for p in params:
+        if p is None or p.grad is None:
+            continue
+        g = p.grad.detach().float()
+        total += float(g.pow(2).sum().item())
+    return math.sqrt(total) if total > 0 else 0.0
 
 
 # -----------------------------
@@ -508,14 +544,16 @@ class SharedPartPrototypeDINO(nn.Module):
         relu_sim = F.relu(sim)
 
         if cfg.score_mode == "resp_sum":
-            proto_score = (responsibility * relu_sim).sum(dim=2)  # B,P,K
+            proto_score_raw = (responsibility * relu_sim).sum(dim=2)  # B,P,K
         elif cfg.score_mode == "scan_max":
-            proto_score = relu_sim.max(dim=2).values
+            proto_score_raw = relu_sim.max(dim=2).values
         elif cfg.score_mode == "scan_topk":
             kk = min(max(1, cfg.scan_topk), relu_sim.shape[2])
-            proto_score = relu_sim.topk(kk, dim=2).values.mean(dim=2)
+            proto_score_raw = relu_sim.topk(kk, dim=2).values.mean(dim=2)
         else:
             raise ValueError(f"Unknown score_mode={cfg.score_mode}")
+
+        proto_score = proto_score_raw * float(cfg.score_scale)
 
         utilization = responsibility.sum(dim=2)
         class_weight = self.class_weights()
@@ -535,6 +573,7 @@ class SharedPartPrototypeDINO(nn.Module):
             "proto_assign": proto_assign,
             "responsibility": responsibility,
             "utilization": utilization,
+            "proto_score_raw": proto_score_raw,
             "proto_score": proto_score,
             "class_weight": class_weight,
             "contributions": contributions,
@@ -610,6 +649,58 @@ def within_part_prototype_diversity_loss(prototypes: torch.Tensor) -> torch.Tens
 
 def classifier_sparsity_loss(class_weight: torch.Tensor) -> torch.Tensor:
     return class_weight.mean()
+
+
+@torch.no_grad()
+def compute_batch_debug_stats(out: Dict[str, torch.Tensor], valid_bp: torch.Tensor, y: torch.Tensor) -> Dict[str, float]:
+    """Forward-pass diagnostics used to decide whether training is actually moving."""
+    logits = out["logits"].float()
+    proto_score = out["proto_score"].float()
+    proto_score_raw = out.get("proto_score_raw", proto_score).float()
+    class_weight = out["class_weight"].float()
+    part_map = out["part_map"].float()
+    visibility = out["visibility"].float()
+    utilization = out["utilization"].float()
+    sim = out["sim"].float()
+
+    if logits.shape[1] >= 2:
+        top2_vals = logits.topk(2, dim=1).values
+        logit_margin = top2_vals[:, 0] - top2_vals[:, 1]
+    else:
+        logit_margin = logits.new_zeros((logits.shape[0],))
+
+    part_dist = part_map / part_map.sum(dim=-1, keepdim=True).clamp_min(cfg.eps)
+    part_entropy = -(part_dist.clamp_min(cfg.eps) * part_dist.clamp_min(cfg.eps).log()).sum(dim=-1)
+
+    pred = logits.argmax(dim=1)
+    true_logit = logits.gather(1, y.view(-1, 1)).squeeze(1)
+    pred_logit = logits.gather(1, pred.view(-1, 1)).squeeze(1)
+
+    return {
+        "valid_bp_ratio": _finite_float(valid_bp.float().mean()),
+        "proto_score_raw_mean": _finite_float(proto_score_raw.mean()),
+        "proto_score_raw_max": _finite_float(proto_score_raw.max()),
+        "proto_score_mean": _finite_float(proto_score.mean()),
+        "proto_score_std": _finite_float(proto_score.std(unbiased=False)),
+        "proto_score_max": _finite_float(proto_score.max()),
+        "relu_sim_mean": _finite_float(F.relu(sim).mean()),
+        "relu_sim_max": _finite_float(F.relu(sim).max()),
+        "utilization_mean": _finite_float(utilization.mean()),
+        "utilization_max": _finite_float(utilization.max()),
+        "visibility_mean": _finite_float(visibility.mean()),
+        "visibility_min": _finite_float(visibility.min()),
+        "part_entropy_mean": _finite_float(part_entropy.mean()),
+        "logits_mean": _finite_float(logits.mean()),
+        "logits_std": _finite_float(logits.std(unbiased=False)),
+        "logits_min": _finite_float(logits.min()),
+        "logits_max": _finite_float(logits.max()),
+        "logit_margin_mean": _finite_float(logit_margin.mean()),
+        "true_minus_pred_logit_mean": _finite_float((true_logit - pred_logit).mean()),
+        "class_weight_mean": _finite_float(class_weight.mean()),
+        "class_weight_std": _finite_float(class_weight.std(unbiased=False)),
+        "class_weight_max": _finite_float(class_weight.max()),
+        "class_weight_gt_1e_3_ratio": _finite_float((class_weight > 1e-3).float().mean()),
+    }
 
 
 @torch.no_grad()
@@ -779,6 +870,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--parts", default=",".join(cfg.parts), help="Comma-separated parts.")
     p.add_argument("--k-per-part", type=int, default=cfg.k_per_part)
     p.add_argument("--score-mode", choices=["resp_sum", "scan_max", "scan_topk"], default=cfg.score_mode)
+    p.add_argument("--score-scale", type=float, default=cfg.score_scale,
+                   help="Multiplies prototype evidence before the non-negative class readout. Useful for resp_sum.")
     p.add_argument("--scan-topk", type=int, default=cfg.scan_topk)
     p.add_argument("--unfreeze-last-blocks", type=int, default=cfg.unfreeze_last_blocks)
     p.add_argument("--freeze-backbone-epochs", type=int, default=cfg.freeze_backbone_epochs)
@@ -813,6 +906,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-bootstrap", action="store_true")
     p.add_argument("--bootstrap-batches", type=int, default=cfg.bootstrap_batches)
     p.add_argument("--no-scan-purity", action="store_true")
+    p.add_argument("--no-train-debug", action="store_true")
+    p.add_argument("--debug-every", type=int, default=cfg.debug_every,
+                   help="Update tqdm debug postfix every N batches.")
     return p.parse_args()
 
 
@@ -827,6 +923,7 @@ def apply_args(args: argparse.Namespace) -> None:
     cfg.parts = tuple([x.strip().lower() for x in args.parts.split(",") if x.strip()])
     cfg.k_per_part = args.k_per_part
     cfg.score_mode = args.score_mode
+    cfg.score_scale = args.score_scale
     cfg.scan_topk = args.scan_topk
     cfg.unfreeze_last_blocks = args.unfreeze_last_blocks
     cfg.freeze_backbone_epochs = args.freeze_backbone_epochs
@@ -859,6 +956,8 @@ def apply_args(args: argparse.Namespace) -> None:
     cfg.bootstrap_memory = not args.skip_bootstrap
     cfg.bootstrap_batches = args.bootstrap_batches
     cfg.compute_scan_purity = not args.no_scan_purity
+    cfg.log_train_debug = not args.no_train_debug
+    cfg.debug_every = args.debug_every
 
 
 def preflight() -> None:
@@ -966,6 +1065,8 @@ def main() -> None:
         t0 = time.time()
         lam_route = route_lambda(epoch)
         totals = {"loss":0.0, "ce":0.0, "route":0.0, "vis":0.0, "lb":0.0, "div":0.0, "sparse":0.0, "correct":0, "count":0}
+        debug_totals: Dict[str, float] = {}
+        debug_count = 0
         pbar = tqdm(dl_train, desc=f"Train {epoch}/{cfg.epochs}", ncols=160)
         for batch_idx, (images, boxes, y, _) in enumerate(pbar, start=1):
             if cfg.max_train_batches > 0 and batch_idx > cfg.max_train_batches:
@@ -987,9 +1088,23 @@ def main() -> None:
                 loss = (cfg.lambda_ce * loss_ce + lam_route * loss_route + cfg.lambda_vis * loss_vis
                         + cfg.lambda_proto_lb * loss_lb + cfg.lambda_proto_div * loss_div
                         + cfg.lambda_cls_sparse * loss_sparse)
+
+            fwd_debug = compute_batch_debug_stats(out, valid_bp, y) if cfg.log_train_debug else {}
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            grad_debug = {}
+            if cfg.log_train_debug:
+                grad_debug = {
+                    "grad_part_queries": grad_norm_of_tensors([model.part_queries]),
+                    "grad_null_logits": grad_norm_of_tensors([model.null_logits]),
+                    "grad_proto_residual": grad_norm_of_tensors([model.proto_residual]),
+                    "grad_class_theta": grad_norm_of_tensors([model.class_theta]),
+                    "grad_class_bias": grad_norm_of_tensors([model.class_bias]),
+                    "grad_backbone": grad_norm_of_tensors(p for p in model.backbone.parameters() if p.requires_grad),
+                }
+            total_grad = nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            if cfg.log_train_debug:
+                grad_debug["grad_total_preclip"] = _finite_float(total_grad)
             scaler.step(optimizer)
             scaler.update()
             if epoch >= cfg.ema_start_epoch and (global_step % max(1, cfg.ema_every_steps) == 0):
@@ -1001,23 +1116,49 @@ def main() -> None:
             totals["correct"] += int((out["logits"].argmax(1) == y).sum().item())
             for key, val in [("loss", loss), ("ce", loss_ce), ("route", loss_route), ("vis", loss_vis), ("lb", loss_lb), ("div", loss_div), ("sparse", loss_sparse)]:
                 totals[key] += float(val.detach().item()) * bs
-            pbar.set_postfix(acc=totals["correct"] / max(1, totals["count"]), loss=totals["loss"] / max(1, totals["count"]))
+
+            if cfg.log_train_debug:
+                batch_debug = dict(fwd_debug)
+                batch_debug.update(grad_debug)
+                add_weighted_stats(debug_totals, batch_debug, bs)
+                debug_count += bs
+
+            if batch_idx % max(1, cfg.debug_every) == 0 or batch_idx == 1:
+                pbar.set_postfix(
+                    acc=totals["correct"] / max(1, totals["count"]),
+                    loss=totals["loss"] / max(1, totals["count"]),
+                    ps=f"{fwd_debug.get('proto_score_mean', 0.0):.3g}" if cfg.log_train_debug else "na",
+                    lstd=f"{fwd_debug.get('logits_std', 0.0):.3g}" if cfg.log_train_debug else "na",
+                    gcls=f"{grad_debug.get('grad_class_theta', 0.0):.3g}" if cfg.log_train_debug else "na",
+                )
 
         n = max(1, totals["count"])
         train_metrics = {k: (v / n if k not in {"correct", "count"} else v) for k, v in totals.items()}
         train_metrics["acc"] = totals["correct"] / n
-        record: Dict[str, Any] = {"epoch": epoch, "time_sec": time.time() - t0, "train": train_metrics}
+        train_debug = {k: v / max(1, debug_count) for k, v in debug_totals.items()}
+        record: Dict[str, Any] = {"epoch": epoch, "time_sec": time.time() - t0, "train": train_metrics, "train_debug": train_debug}
 
         if epoch % cfg.eval_every == 0:
             eval_metrics = compute_eval(model, dl_test, epoch)
             record["eval"] = eval_metrics
             acc = float(eval_metrics["acc"])
-            print(f"[Epoch {epoch}] train_acc={train_metrics['acc']:.4f} eval_acc={acc:.4f} scan_purity={eval_metrics.get('scan_part_purity')}")
+            print(
+                f"[Epoch {epoch}] train_acc={train_metrics['acc']:.4f} eval_acc={acc:.4f} "
+                f"scan_purity={eval_metrics.get('scan_part_purity')} "
+                f"proto_mean={train_debug.get('proto_score_mean', 0.0):.3g} "
+                f"logits_std={train_debug.get('logits_std', 0.0):.3g} "
+                f"grad_cls={train_debug.get('grad_class_theta', 0.0):.3g}"
+            )
             if acc > best_acc:
                 best_acc = acc
                 save_checkpoint(os.path.join(cfg.save_dir, "best.pth"), model, optimizer, scaler, epoch, best_acc)
         else:
-            print(f"[Epoch {epoch}] train_acc={train_metrics['acc']:.4f}")
+            print(
+                f"[Epoch {epoch}] train_acc={train_metrics['acc']:.4f} "
+                f"proto_mean={train_debug.get('proto_score_mean', 0.0):.3g} "
+                f"logits_std={train_debug.get('logits_std', 0.0):.3g} "
+                f"grad_cls={train_debug.get('grad_class_theta', 0.0):.3g}"
+            )
 
         record["best_acc"] = best_acc
         with open(log_path, "a", encoding="utf-8") as f:
@@ -1031,6 +1172,11 @@ def main() -> None:
             "last_checkpoint": os.path.join(cfg.save_dir, "last.pth"),
             "best_checkpoint": os.path.join(cfg.save_dir, "best.pth"),
             "score_mode": cfg.score_mode,
+            "score_scale": cfg.score_scale,
+            "last_proto_score_mean": float(train_debug.get("proto_score_mean", 0.0)),
+            "last_logits_std": float(train_debug.get("logits_std", 0.0)),
+            "last_grad_class_theta": float(train_debug.get("grad_class_theta", 0.0)),
+            "last_valid_bp_ratio": float(train_debug.get("valid_bp_ratio", 0.0)),
         }
         with open(os.path.join(cfg.save_dir, "status.json"), "w", encoding="utf-8") as f:
             json.dump(status, f, indent=2)
