@@ -116,6 +116,7 @@ class CFG:
     # Train.
     epochs: int = 100
     batch_size: int = 32
+    max_train_batches: int = 0  # 0 means full epoch
     num_workers: int = 4
     seed: int = 0
     amp: bool = True
@@ -784,6 +785,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-unfreeze-norm", action="store_true")
     p.add_argument("--epochs", type=int, default=cfg.epochs)
     p.add_argument("--batch-size", type=int, default=cfg.batch_size)
+    p.add_argument("--max-train-batches", type=int, default=cfg.max_train_batches, help="Limit train batches per epoch; 0 means full epoch.")
     p.add_argument("--num-workers", type=int, default=cfg.num_workers)
     p.add_argument("--seed", type=int, default=cfg.seed)
     p.add_argument("--lr-backbone", type=float, default=cfg.lr_backbone)
@@ -831,6 +833,7 @@ def apply_args(args: argparse.Namespace) -> None:
     cfg.unfreeze_norm = not args.no_unfreeze_norm
     cfg.epochs = args.epochs
     cfg.batch_size = args.batch_size
+    cfg.max_train_batches = args.max_train_batches
     cfg.num_workers = args.num_workers
     cfg.seed = args.seed
     cfg.lr_backbone = args.lr_backbone
@@ -964,7 +967,9 @@ def main() -> None:
         lam_route = route_lambda(epoch)
         totals = {"loss":0.0, "ce":0.0, "route":0.0, "vis":0.0, "lb":0.0, "div":0.0, "sparse":0.0, "correct":0, "count":0}
         pbar = tqdm(dl_train, desc=f"Train {epoch}/{cfg.epochs}", ncols=160)
-        for images, boxes, y, _ in pbar:
+        for batch_idx, (images, boxes, y, _) in enumerate(pbar, start=1):
+            if cfg.max_train_batches > 0 and batch_idx > cfg.max_train_batches:
+                break
             images = images.to(DEVICE, non_blocking=True).float()
             boxes = boxes.to(DEVICE, non_blocking=True).float()
             y = y.to(DEVICE, non_blocking=True)
