@@ -5,10 +5,11 @@ This is the "scheme A" version discussed in chat:
 
   shared part-level prototype memory M[p,k]
   + bounded trainable residual R[p,k]
-  + class-specific non-negative readout weights w[c,p,k]
+  + class-specific additive readout weights w[c,p,k] (non-negative or signed)
 
 The prototypes are shared across classes.  Class contrast is produced by
-class-specific readout weights over the same shared part-concept dictionary:
+class-specific readout weights over the same shared part-concept dictionary.
+The default readout is non-negative; --readout-mode signed enables positive/negative evidence:
 
   logit_c(x) = bias_c + sum_p sum_k w[c,p,k] * e[p,k](x)
 
@@ -84,6 +85,9 @@ class CFG:
     null_logit_init: float = 0.0
     residual_scale: float = 0.20
     class_theta_init: float = 0.0
+    # nonneg: softplus(class_theta), support-only evidence.
+    # signed: raw class_theta, allowing positive and negative evidence.
+    readout_mode: str = "nonneg"
 
     # EMA memory update.
     ema_rho: float = 0.97
@@ -523,7 +527,11 @@ class SharedPartPrototypeDINO(nn.Module):
         return l2n(self.memory.float() + delta, dim=-1, eps=cfg.eps)
 
     def class_weights(self) -> torch.Tensor:
-        return F.softplus(self.class_theta.float())
+        if cfg.readout_mode == "nonneg":
+            return F.softplus(self.class_theta.float())
+        if cfg.readout_mode == "signed":
+            return self.class_theta.float()
+        raise ValueError(f"Unknown readout_mode={cfg.readout_mode}")
 
     def forward(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
         x, h, w = self.extract_tokens(images)
@@ -648,6 +656,8 @@ def within_part_prototype_diversity_loss(prototypes: torch.Tensor) -> torch.Tens
 
 
 def classifier_sparsity_loss(class_weight: torch.Tensor) -> torch.Tensor:
+    if cfg.readout_mode == "signed":
+        return class_weight.abs().mean()
     return class_weight.mean()
 
 
@@ -697,9 +707,13 @@ def compute_batch_debug_stats(out: Dict[str, torch.Tensor], valid_bp: torch.Tens
         "logit_margin_mean": _finite_float(logit_margin.mean()),
         "true_minus_pred_logit_mean": _finite_float((true_logit - pred_logit).mean()),
         "class_weight_mean": _finite_float(class_weight.mean()),
+        "class_weight_abs_mean": _finite_float(class_weight.abs().mean()),
         "class_weight_std": _finite_float(class_weight.std(unbiased=False)),
+        "class_weight_min": _finite_float(class_weight.min()),
         "class_weight_max": _finite_float(class_weight.max()),
-        "class_weight_gt_1e_3_ratio": _finite_float((class_weight > 1e-3).float().mean()),
+        "class_weight_pos_ratio": _finite_float((class_weight > 1e-3).float().mean()),
+        "class_weight_neg_ratio": _finite_float((class_weight < -1e-3).float().mean()),
+        "class_weight_active_ratio": _finite_float((class_weight.abs() > 1e-3).float().mean()),
     }
 
 
@@ -885,11 +899,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr-router", type=float, default=cfg.lr_router)
     p.add_argument("--lr-proto", type=float, default=cfg.lr_proto)
     p.add_argument("--lr-classifier", type=float, default=cfg.lr_classifier)
+    p.add_argument("--weight-decay", type=float, default=cfg.weight_decay)
     p.add_argument("--ema-rho", type=float, default=cfg.ema_rho)
     p.add_argument("--ema-sem-mix", type=float, default=cfg.ema_sem_mix)
     p.add_argument("--ema-start-epoch", type=int, default=cfg.ema_start_epoch)
     p.add_argument("--residual-scale", type=float, default=cfg.residual_scale)
     p.add_argument("--class-theta-init", type=float, default=cfg.class_theta_init)
+    p.add_argument("--readout-mode", choices=["nonneg", "signed"], default=cfg.readout_mode,
+                   help="Class readout: nonneg uses softplus weights; signed uses raw weights for positive/negative evidence.")
     p.add_argument("--lambda-route", type=float, default=cfg.lambda_route)
     p.add_argument("--route-final-ratio", type=float, default=cfg.route_final_ratio)
     p.add_argument("--route-decay-epochs", type=int, default=cfg.route_decay_epochs)
@@ -937,11 +954,13 @@ def apply_args(args: argparse.Namespace) -> None:
     cfg.lr_router = args.lr_router
     cfg.lr_proto = args.lr_proto
     cfg.lr_classifier = args.lr_classifier
+    cfg.weight_decay = args.weight_decay
     cfg.ema_rho = args.ema_rho
     cfg.ema_sem_mix = args.ema_sem_mix
     cfg.ema_start_epoch = args.ema_start_epoch
     cfg.residual_scale = args.residual_scale
     cfg.class_theta_init = args.class_theta_init
+    cfg.readout_mode = args.readout_mode
     cfg.lambda_route = args.lambda_route
     cfg.route_final_ratio = args.route_final_ratio
     cfg.route_decay_epochs = args.route_decay_epochs
@@ -1045,7 +1064,7 @@ def main() -> None:
         bootstrap_memory_from_part_boxes(model, dl_train)
 
     print(f"[Data] train={len(ds_train)} test={len(ds_test)} parts={cfg.parts} K={cfg.k_per_part}")
-    print(f"[Train] device={DEVICE} amp={cfg.amp} score_mode={cfg.score_mode}")
+    print(f"[Train] device={DEVICE} amp={cfg.amp} score_mode={cfg.score_mode} readout_mode={cfg.readout_mode}")
     log_path = os.path.join(cfg.save_dir, "history.jsonl")
 
     global_step = 0
@@ -1173,6 +1192,7 @@ def main() -> None:
             "best_checkpoint": os.path.join(cfg.save_dir, "best.pth"),
             "score_mode": cfg.score_mode,
             "score_scale": cfg.score_scale,
+            "readout_mode": cfg.readout_mode,
             "last_proto_score_mean": float(train_debug.get("proto_score_mean", 0.0)),
             "last_logits_std": float(train_debug.get("logits_std", 0.0)),
             "last_grad_class_theta": float(train_debug.get("grad_class_theta", 0.0)),
