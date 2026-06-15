@@ -75,6 +75,8 @@ class CFG:
     # resp_sum: original responsibility-weighted evidence.
     # scan_max: full-image prototype scan max, no part-box mask.
     # scan_topk: average top-k full-image prototype responses.
+    # part_max: part-gated max prototype response.
+    # part_topk: average top-k part-gated prototype responses.
     score_mode: str = "resp_sum"
     # Important for resp_sum: part_map and proto softmax make evidence small.
     # This only calibrates logit scale; it does not change evidence attribution.
@@ -97,6 +99,7 @@ class CFG:
     ema_sem_mix: float = 0.50
     ema_min_mass: float = 1e-3
     ema_start_epoch: int = 1
+    ema_stop_epoch: int = 0  # 0 means never stop EMA
     ema_every_steps: int = 1
 
     # Part-box target.
@@ -561,6 +564,13 @@ class SharedPartPrototypeDINO(nn.Module):
         elif cfg.score_mode == "scan_topk":
             kk = min(max(1, cfg.scan_topk), relu_sim.shape[2])
             proto_score_raw = relu_sim.topk(kk, dim=2).values.mean(dim=2)
+        elif cfg.score_mode == "part_max":
+            gated = part_map.unsqueeze(-1) * relu_sim
+            proto_score_raw = gated.max(dim=2).values
+        elif cfg.score_mode == "part_topk":
+            gated = part_map.unsqueeze(-1) * relu_sim
+            kk = min(max(1, cfg.scan_topk), gated.shape[2])
+            proto_score_raw = gated.topk(kk, dim=2).values.mean(dim=2)
         else:
             raise ValueError(f"Unknown score_mode={cfg.score_mode}")
 
@@ -891,7 +901,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--image-size", type=int, default=cfg.image_size)
     p.add_argument("--parts", default=",".join(cfg.parts), help="Comma-separated parts.")
     p.add_argument("--k-per-part", type=int, default=cfg.k_per_part)
-    p.add_argument("--score-mode", choices=["resp_sum", "scan_max", "scan_topk"], default=cfg.score_mode)
+    p.add_argument("--score-mode", choices=["resp_sum", "scan_max", "scan_topk", "part_max", "part_topk"], default=cfg.score_mode)
     p.add_argument("--score-scale", type=float, default=cfg.score_scale,
                    help="Multiplies prototype evidence before the non-negative class readout. Useful for resp_sum.")
     p.add_argument("--proto-dropout", type=float, default=cfg.proto_dropout,
@@ -913,6 +923,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ema-rho", type=float, default=cfg.ema_rho)
     p.add_argument("--ema-sem-mix", type=float, default=cfg.ema_sem_mix)
     p.add_argument("--ema-start-epoch", type=int, default=cfg.ema_start_epoch)
+    p.add_argument("--ema-stop-epoch", type=int, default=cfg.ema_stop_epoch,
+                   help="Stop EMA memory update after this epoch; 0 means never stop.")
     p.add_argument("--residual-scale", type=float, default=cfg.residual_scale)
     p.add_argument("--class-theta-init", type=float, default=cfg.class_theta_init)
     p.add_argument("--readout-mode", choices=["nonneg", "signed"], default=cfg.readout_mode,
@@ -923,6 +935,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lambda-vis", type=float, default=cfg.lambda_vis)
     p.add_argument("--lambda-proto-lb", type=float, default=cfg.lambda_proto_lb)
     p.add_argument("--lambda-proto-div", type=float, default=cfg.lambda_proto_div)
+    p.add_argument("--lambda-cls-sparse", type=float, default=cfg.lambda_cls_sparse,
+                   help="Sparsity penalty weight on class readout weights.")
+    p.add_argument("--label-smoothing", type=float, default=cfg.label_smoothing,
+                   help="Label smoothing for the cross-entropy loss.")
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--no-resume", action="store_true")
     p.add_argument("--resume-from", choices=["last", "best", "none"], default=cfg.resume_from)
@@ -969,6 +985,7 @@ def apply_args(args: argparse.Namespace) -> None:
     cfg.ema_rho = args.ema_rho
     cfg.ema_sem_mix = args.ema_sem_mix
     cfg.ema_start_epoch = args.ema_start_epoch
+    cfg.ema_stop_epoch = args.ema_stop_epoch
     cfg.residual_scale = args.residual_scale
     cfg.class_theta_init = args.class_theta_init
     cfg.readout_mode = args.readout_mode
@@ -978,6 +995,8 @@ def apply_args(args: argparse.Namespace) -> None:
     cfg.lambda_vis = args.lambda_vis
     cfg.lambda_proto_lb = args.lambda_proto_lb
     cfg.lambda_proto_div = args.lambda_proto_div
+    cfg.lambda_cls_sparse = args.lambda_cls_sparse
+    cfg.label_smoothing = args.label_smoothing
     cfg.amp = not args.no_amp
     cfg.resume = not args.no_resume
     cfg.resume_from = args.resume_from
@@ -1137,7 +1156,10 @@ def main() -> None:
                 grad_debug["grad_total_preclip"] = _finite_float(total_grad)
             scaler.step(optimizer)
             scaler.update()
-            if epoch >= cfg.ema_start_epoch and (global_step % max(1, cfg.ema_every_steps) == 0):
+            ema_allowed = epoch >= cfg.ema_start_epoch
+            if cfg.ema_stop_epoch > 0:
+                ema_allowed = ema_allowed and epoch <= cfg.ema_stop_epoch
+            if ema_allowed and (global_step % max(1, cfg.ema_every_steps) == 0):
                 model.ema_update_memory(out["Xn"].detach(), out["part_map"].detach(), out["proto_assign"].detach(), q_sem.detach(), valid_bp.detach())
             global_step += 1
 
@@ -1204,6 +1226,11 @@ def main() -> None:
             "score_mode": cfg.score_mode,
             "score_scale": cfg.score_scale,
             "proto_dropout": cfg.proto_dropout,
+            "scan_topk": cfg.scan_topk,
+            "ema_stop_epoch": cfg.ema_stop_epoch,
+            "lambda_proto_lb": cfg.lambda_proto_lb,
+            "label_smoothing": cfg.label_smoothing,
+            "lambda_cls_sparse": cfg.lambda_cls_sparse,
             "readout_mode": cfg.readout_mode,
             "last_proto_score_mean": float(train_debug.get("proto_score_mean", 0.0)),
             "last_logits_std": float(train_debug.get("logits_std", 0.0)),
