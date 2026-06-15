@@ -79,6 +79,9 @@ class CFG:
     # Important for resp_sum: part_map and proto softmax make evidence small.
     # This only calibrates logit scale; it does not change evidence attribution.
     score_scale: float = 20.0
+    # Drop prototype evidence before class readout during training only.
+    # This regularizes the classifier without changing stored explanation scores.
+    proto_dropout: float = 0.0
     scan_topk: int = 3
     tau_part: float = 0.20
     tau_proto: float = 0.05
@@ -565,8 +568,12 @@ class SharedPartPrototypeDINO(nn.Module):
 
         utilization = responsibility.sum(dim=2)
         class_weight = self.class_weights()
-        contributions = proto_score[:, None] * class_weight[None]  # B,C,P,K
-        part_evidence = contributions.sum(dim=-1)                  # B,C,P
+        if self.training and float(cfg.proto_dropout) > 0.0:
+            proto_score_for_cls = F.dropout(proto_score, p=float(cfg.proto_dropout), training=True)
+        else:
+            proto_score_for_cls = proto_score
+        contributions = proto_score_for_cls[:, None] * class_weight[None]  # B,C,P,K
+        part_evidence = contributions.sum(dim=-1)                         # B,C,P
         logits = self.class_bias.float().view(1, -1) + part_evidence.sum(dim=-1)
 
         return {
@@ -583,6 +590,7 @@ class SharedPartPrototypeDINO(nn.Module):
             "utilization": utilization,
             "proto_score_raw": proto_score_raw,
             "proto_score": proto_score,
+            "proto_score_for_cls": proto_score_for_cls,
             "class_weight": class_weight,
             "contributions": contributions,
             "part_evidence": part_evidence,
@@ -886,6 +894,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--score-mode", choices=["resp_sum", "scan_max", "scan_topk"], default=cfg.score_mode)
     p.add_argument("--score-scale", type=float, default=cfg.score_scale,
                    help="Multiplies prototype evidence before the non-negative class readout. Useful for resp_sum.")
+    p.add_argument("--proto-dropout", type=float, default=cfg.proto_dropout,
+                   help="Dropout probability applied to proto_score before class readout during training only.")
     p.add_argument("--scan-topk", type=int, default=cfg.scan_topk)
     p.add_argument("--unfreeze-last-blocks", type=int, default=cfg.unfreeze_last_blocks)
     p.add_argument("--freeze-backbone-epochs", type=int, default=cfg.freeze_backbone_epochs)
@@ -941,6 +951,7 @@ def apply_args(args: argparse.Namespace) -> None:
     cfg.k_per_part = args.k_per_part
     cfg.score_mode = args.score_mode
     cfg.score_scale = args.score_scale
+    cfg.proto_dropout = args.proto_dropout
     cfg.scan_topk = args.scan_topk
     cfg.unfreeze_last_blocks = args.unfreeze_last_blocks
     cfg.freeze_backbone_epochs = args.freeze_backbone_epochs
@@ -1192,6 +1203,7 @@ def main() -> None:
             "best_checkpoint": os.path.join(cfg.save_dir, "best.pth"),
             "score_mode": cfg.score_mode,
             "score_scale": cfg.score_scale,
+            "proto_dropout": cfg.proto_dropout,
             "readout_mode": cfg.readout_mode,
             "last_proto_score_mean": float(train_debug.get("proto_score_mean", 0.0)),
             "last_logits_std": float(train_debug.get("logits_std", 0.0)),
