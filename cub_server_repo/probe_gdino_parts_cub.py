@@ -1,6 +1,6 @@
 from PIL import Image, ImageDraw, ImageFont
 from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
-
+import os, random, inspect, json, torch, numpy as np
 CUB_ROOT = "./data/CUB_200_2011"
 OUT = "./runs/gdino_5img_probe_prompt_ensemble"
 IMAGE_SIZE = 224
