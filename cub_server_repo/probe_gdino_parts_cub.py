@@ -3,7 +3,7 @@ from PIL import Image, ImageDraw, ImageFont
 from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 
 CUB_ROOT = "./data/CUB_200_2011"
-OUT = "./runs/gdino_10img_probe_part_specific"
+OUT = "./runs/gdino_10img_probe_fixedprompt"
 IMAGE_SIZE = 224
 
 BOX_THR = 0.22
@@ -11,43 +11,23 @@ TEXT_THR = 0.18
 
 SEED = 0
 NUM_IMAGES = 10
-SPLIT = "train"  # train / test / all
+SPLIT = "train"   # train / test / all
 
 USE_GT_BBOX_CROP = True
 
 PARTS = ["beak", "head", "tail", "body", "feet", "wing"]
 
-# 按前面5张图统计后保留的 prompt
+# 每个部位固定一个 prompt
 PROMPTS = {
-    "beak": [
-        "beak of a bird.",
-        "bird bill.",
-    ],
-    "head": [
-        "head of a bird.",
-        "bird head.",
-    ],
-    "tail": [
-        "tail feathers.",
-        "bird tail feathers.",
-    ],
-    "body": [
-        "bird breast.",
-        "breast of a bird.",
-        "bird belly.",
-    ],
-    "feet": [
-        "bird foot.",
-        "bird feet.",
-    ],
-    "wing": [
-        "left bird wing.",
-        "right bird wing.",
-        "wing of a bird.",
-    ],
+    "beak": "beak of a bird.",
+    "head": "head of a bird.",
+    "tail": "tail feathers.",
+    "body": "bird breast.",
+    "feet": "bird foot.",
+    "wing": "wing of a bird.",
 }
 
-# 每个部位最多保留几个框
+# feet / wing 最多保留2个，其余1个
 MAX_KEEP = {
     "beak": 1,
     "head": 1,
@@ -57,7 +37,6 @@ MAX_KEEP = {
     "wing": 2,
 }
 
-# 第二个框是否保留，只对 feet / wing 生效
 SECOND_BOX_MIN_SCORE = {
     "feet": 0.16,
     "wing": 0.16,
@@ -70,9 +49,10 @@ SECOND_BOX_REL_SCORE = {
 
 IOU_DUP_THR = 0.80
 
-# area 过滤。area > 0.95 统一认为是整图异常框。
-ABNORMAL_AREA_THR = 0.95
+# 统一规则：area > 0.8 直接 drop
+DROP_AREA_THR = 0.80
 
+# 防止特别离谱的小框
 MIN_AREA = {
     "beak": 0.0002,
     "head": 0.001,
@@ -80,15 +60,6 @@ MIN_AREA = {
     "body": 0.005,
     "feet": 0.0003,
     "wing": 0.002,
-}
-
-MAX_AREA = {
-    "beak": 0.25,
-    "head": 0.45,
-    "tail": 0.60,
-    "body": 0.65,
-    "feet": 0.20,
-    "wing": 0.70,
 }
 
 COLORS = {
@@ -188,12 +159,10 @@ def post_process(processor, outputs, input_ids, image_size):
 
 def clamp_box(box):
     x1, y1, x2, y2 = box
-
     x1 = max(0.0, min(float(IMAGE_SIZE), float(x1)))
     y1 = max(0.0, min(float(IMAGE_SIZE), float(y1)))
     x2 = max(0.0, min(float(IMAGE_SIZE), float(x2)))
     y2 = max(0.0, min(float(IMAGE_SIZE), float(y2)))
-
     return [x1, y1, x2, y2]
 
 
@@ -225,7 +194,9 @@ def box_iou_xyxy(a, b):
 
 
 @torch.no_grad()
-def run_one_prompt(img, prompt, processor, model):
+def detect_part(img, part, processor, model):
+    prompt = PROMPTS[part]
+
     inputs = processor(
         images=img,
         text=prompt,
@@ -247,7 +218,7 @@ def run_one_prompt(img, prompt, processor, model):
     candidates = []
 
     if len(boxes) == 0:
-        return candidates
+        return [], []
 
     order = torch.argsort(scores, descending=True).tolist()
 
@@ -260,33 +231,23 @@ def run_one_prompt(img, prompt, processor, model):
             "score": float(scores[idx]),
             "area": float(area),
             "prompt": prompt,
-            "drop_fullbox": bool(area > ABNORMAL_AREA_THR),
+            "drop_area": bool(area > DROP_AREA_THR),
         })
 
-    return candidates
+    valid = [
+        c for c in candidates
+        if (not c["drop_area"]) and (c["area"] >= MIN_AREA[part])
+    ]
 
-
-def valid_candidate(part, c):
-    if c["drop_fullbox"]:
-        return False
-    if c["area"] < MIN_AREA[part]:
-        return False
-    if c["area"] > MAX_AREA[part]:
-        return False
-    return True
-
-
-def select_candidates(part, candidates):
-    valid = [c for c in candidates if valid_candidate(part, c)]
     valid = sorted(valid, key=lambda x: x["score"], reverse=True)
 
     if len(valid) == 0:
-        return []
+        return [], candidates
 
     max_keep = MAX_KEEP[part]
 
     if max_keep == 1:
-        return [valid[0]]
+        return [valid[0]], candidates
 
     keep = [valid[0]]
     top1_score = valid[0]["score"]
@@ -302,26 +263,7 @@ def select_candidates(part, candidates):
         if cond_abs and cond_rel and cond_iou:
             keep.append(cand)
 
-    return keep
-
-
-@torch.no_grad()
-def detect_part(img, part, processor, model):
-    all_candidates = []
-    per_prompt = {}
-
-    for prompt in PROMPTS[part]:
-        cands = run_one_prompt(img, prompt, processor, model)
-        per_prompt[prompt] = cands
-
-        for c in cands:
-            cc = dict(c)
-            cc["part"] = part
-            all_candidates.append(cc)
-
-    selected = select_candidates(part, all_candidates)
-
-    return selected, all_candidates, per_prompt
+    return keep, candidates
 
 
 def draw_selected_overlay(img, selected_by_part):
@@ -331,7 +273,6 @@ def draw_selected_overlay(img, selected_by_part):
 
     for part in PARTS:
         color = COLORS[part]
-
         for det in selected_by_part[part]:
             x1, y1, x2, y2 = det["box"]
             box = [int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))]
@@ -406,40 +347,12 @@ def make_selected_sheet(img, selected_by_part, title):
     return canvas
 
 
-def summarize_candidates(part, per_prompt):
-    lines = []
-
-    for prompt, cands in per_prompt.items():
-        if len(cands) == 0:
-            lines.append(f"    prompt={prompt} -> missing")
-            continue
-
-        top = cands[:3]
-
-        for k, c in enumerate(top):
-            box = [round(x, 1) for x in c["box"]]
-            flag = ""
-            if c["drop_fullbox"]:
-                flag += " DROP_FULLBOX"
-            if not valid_candidate(part, c):
-                flag += " DROP_FILTER"
-
-            lines.append(
-                f"    prompt={prompt} cand[{k}] "
-                f"score={c['score']:.3f} "
-                f"area={c['area']:.3f} "
-                f"box={box}{flag}"
-            )
-
-    return lines
-
-
 print("device:", device)
 print("CUB_ROOT:", CUB_ROOT)
 print("OUT:", OUT)
 print("preprocess: GT bbox crop -> resize 224 only -> GroundingDINO")
 print("NUM_IMAGES:", NUM_IMAGES)
-print("BOX_THR:", BOX_THR, "TEXT_THR:", TEXT_THR)
+print("DROP_AREA_THR:", DROP_AREA_THR)
 
 paths = read_kv_text(os.path.join(CUB_ROOT, "images.txt"))
 split = read_kv_int(os.path.join(CUB_ROOT, "train_test_split.txt"))
@@ -465,9 +378,7 @@ stats = {
     part: {
         "selected": 0,
         "missing": 0,
-        "fullbox_dropped": 0,
-        "filter_dropped": 0,
-        "selected_prompts": {},
+        "dropped_area": 0,
     }
     for part in PARTS
 }
@@ -481,42 +392,37 @@ for rank, img_id in enumerate(ids, 1):
     if USE_GT_BBOX_CROP:
         img = crop_bbox(img, bboxes[img_id])
 
-    # 只 resize，不 center crop
     img = resize_only(img, IMAGE_SIZE)
 
     print(f"\n[{rank}] img_id={img_id} {rel}")
 
     selected_by_part = {}
     all_candidates_by_part = {}
-    per_prompt_by_part = {}
 
     for part in PARTS:
-        selected, all_candidates, per_prompt = detect_part(img, part, processor, model)
+        selected, candidates = detect_part(img, part, processor, model)
 
         selected_by_part[part] = selected
-        all_candidates_by_part[part] = all_candidates
-        per_prompt_by_part[part] = per_prompt
+        all_candidates_by_part[part] = candidates
 
-        fullbox_dropped = sum(1 for c in all_candidates if c["drop_fullbox"])
-        filter_dropped = sum(1 for c in all_candidates if not valid_candidate(part, c))
-
-        stats[part]["fullbox_dropped"] += fullbox_dropped
-        stats[part]["filter_dropped"] += filter_dropped
+        dropped_area = sum(1 for c in candidates if c["drop_area"])
+        stats[part]["dropped_area"] += dropped_area
 
         print(f"  {part}:")
-        for line in summarize_candidates(part, per_prompt):
-            print(line)
+        for k, c in enumerate(candidates[:5]):
+            box = [round(x, 1) for x in c["box"]]
+            flag = " DROP_AREA" if c["drop_area"] else ""
+            print(
+                f"    cand[{k}] score={c['score']:.3f} "
+                f"area={c['area']:.3f} box={box}{flag}"
+            )
 
         if len(selected) == 0:
             stats[part]["missing"] += 1
             print("    SELECTED: missing")
         else:
             stats[part]["selected"] += len(selected)
-
             for k, det in enumerate(selected):
-                p = det["prompt"]
-                stats[part]["selected_prompts"][p] = stats[part]["selected_prompts"].get(p, 0) + 1
-
                 box = [round(x, 1) for x in det["box"]]
                 print(
                     f"    SELECTED[{k}]: "
@@ -563,11 +469,7 @@ for part in PARTS:
     print(f"\n{part}:")
     print(f"  selected boxes: {stats[part]['selected']}")
     print(f"  missing images: {stats[part]['missing']}")
-    print(f"  fullbox dropped: {stats[part]['fullbox_dropped']}")
-    print(f"  filter dropped: {stats[part]['filter_dropped']}")
-    print(f"  selected prompts:")
-    for p, n in sorted(stats[part]["selected_prompts"].items(), key=lambda x: -x[1]):
-        print(f"    {p}: {n}")
+    print(f"  dropped_area: {stats[part]['dropped_area']}")
 
 print("\nDone:", OUT)
 print("JSON:", json_path)
