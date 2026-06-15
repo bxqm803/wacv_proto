@@ -3,7 +3,7 @@ from PIL import Image, ImageDraw, ImageFont
 from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 
 CUB_ROOT = "./data/CUB_200_2011"
-OUT = "./runs/gdino_10img_probe_fixedprompt"
+OUT = "./runs/gdino_10img_probe_fixedprompt_selectvalid"
 IMAGE_SIZE = 224
 
 BOX_THR = 0.22
@@ -17,7 +17,7 @@ USE_GT_BBOX_CROP = True
 
 PARTS = ["beak", "head", "tail", "body", "feet", "wing"]
 
-# 每个部位固定一个 prompt
+# 固定 prompt
 PROMPTS = {
     "beak": "beak of a bird.",
     "head": "head of a bird.",
@@ -27,7 +27,7 @@ PROMPTS = {
     "wing": "wing of a bird.",
 }
 
-# feet / wing 最多保留2个，其余1个
+# feet / wing 最多 2 个，其余最多 1 个
 MAX_KEEP = {
     "beak": 1,
     "head": 1,
@@ -48,11 +48,8 @@ SECOND_BOX_REL_SCORE = {
 }
 
 IOU_DUP_THR = 0.80
-
-# 统一规则：area > 0.8 直接 drop
 DROP_AREA_THR = 0.80
 
-# 防止特别离谱的小框
 MIN_AREA = {
     "beak": 0.0002,
     "head": 0.001,
@@ -232,14 +229,14 @@ def detect_part(img, part, processor, model):
             "area": float(area),
             "prompt": prompt,
             "drop_area": bool(area > DROP_AREA_THR),
+            "too_small": bool(area < MIN_AREA[part]),
         })
 
+    # 关键：先过滤，再选择。drop_area 的 cand 完全不参与最终选择
     valid = [
         c for c in candidates
-        if (not c["drop_area"]) and (c["area"] >= MIN_AREA[part])
+        if (not c["drop_area"]) and (not c["too_small"])
     ]
-
-    valid = sorted(valid, key=lambda x: x["score"], reverse=True)
 
     if len(valid) == 0:
         return [], candidates
@@ -288,70 +285,10 @@ def draw_selected_overlay(img, selected_by_part):
     return vis
 
 
-def draw_part(img, selected_by_part, part):
-    vis = img.copy()
-    draw = ImageDraw.Draw(vis)
-    font = ImageFont.load_default()
-    color = COLORS[part]
-
-    for det in selected_by_part[part]:
-        x1, y1, x2, y2 = det["box"]
-        box = [int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))]
-
-        draw.rectangle(box, outline=color, width=3)
-        draw.text(
-            (box[0], max(0, box[1] - 12)),
-            f"{part}:{det['score']:.2f},a={det['area']:.2f}",
-            fill=color,
-            font=font,
-        )
-
-    return vis
-
-
-def make_selected_sheet(img, selected_by_part, title):
-    font = ImageFont.load_default()
-
-    panels = [
-        ("original", img.copy()),
-        ("selected_all", draw_selected_overlay(img, selected_by_part)),
-    ]
-
-    for part in PARTS:
-        panels.append((part, draw_part(img, selected_by_part, part)))
-
-    cols = 4
-    rows = 2
-    label_h = 18
-    header_h = 24
-
-    canvas = Image.new(
-        "RGB",
-        (cols * IMAGE_SIZE, rows * (IMAGE_SIZE + label_h) + header_h),
-        (255, 255, 255),
-    )
-
-    draw = ImageDraw.Draw(canvas)
-    draw.text((4, 4), title, fill=(0, 0, 0), font=font)
-
-    for i, (name, panel) in enumerate(panels):
-        r = i // cols
-        c = i % cols
-
-        x = c * IMAGE_SIZE
-        y = header_h + r * (IMAGE_SIZE + label_h)
-
-        draw.text((x + 4, y + 2), name, fill=(0, 0, 0), font=font)
-        canvas.paste(panel, (x, y + label_h))
-
-    return canvas
-
-
 print("device:", device)
 print("CUB_ROOT:", CUB_ROOT)
 print("OUT:", OUT)
-print("preprocess: GT bbox crop -> resize 224 only -> GroundingDINO")
-print("NUM_IMAGES:", NUM_IMAGES)
+print("preprocess: GT bbox crop -> resize 224 -> GroundingDINO")
 print("DROP_AREA_THR:", DROP_AREA_THR)
 
 paths = read_kv_text(os.path.join(CUB_ROOT, "images.txt"))
@@ -374,14 +311,6 @@ model = AutoModelForZeroShotObjectDetection.from_pretrained(
 ).to(device).eval()
 
 all_results = []
-stats = {
-    part: {
-        "selected": 0,
-        "missing": 0,
-        "dropped_area": 0,
-    }
-    for part in PARTS
-}
 
 for rank, img_id in enumerate(ids, 1):
     rel = paths[img_id]
@@ -392,6 +321,7 @@ for rank, img_id in enumerate(ids, 1):
     if USE_GT_BBOX_CROP:
         img = crop_bbox(img, bboxes[img_id])
 
+    # 画框就是在 resize 后的图上画
     img = resize_only(img, IMAGE_SIZE)
 
     print(f"\n[{rank}] img_id={img_id} {rel}")
@@ -405,53 +335,48 @@ for rank, img_id in enumerate(ids, 1):
         selected_by_part[part] = selected
         all_candidates_by_part[part] = candidates
 
-        dropped_area = sum(1 for c in candidates if c["drop_area"])
-        stats[part]["dropped_area"] += dropped_area
-
         print(f"  {part}:")
-        for k, c in enumerate(candidates[:5]):
+        for k, c in enumerate(candidates[:8]):
             box = [round(x, 1) for x in c["box"]]
-            flag = " DROP_AREA" if c["drop_area"] else ""
+            flag = ""
+            if c["drop_area"]:
+                flag += " DROP_AREA"
+            if c["too_small"]:
+                flag += " TOO_SMALL"
+
             print(
-                f"    cand[{k}] score={c['score']:.3f} "
-                f"area={c['area']:.3f} box={box}{flag}"
+                f"    cand[{k}] "
+                f"score={c['score']:.3f} "
+                f"area={c['area']:.3f} "
+                f"box={box}{flag}"
             )
 
         if len(selected) == 0:
-            stats[part]["missing"] += 1
             print("    SELECTED: missing")
         else:
-            stats[part]["selected"] += len(selected)
             for k, det in enumerate(selected):
                 box = [round(x, 1) for x in det["box"]]
                 print(
                     f"    SELECTED[{k}]: "
                     f"score={det['score']:.3f} "
                     f"area={det['area']:.3f} "
-                    f"box={box} "
-                    f"prompt={det['prompt']}"
+                    f"box={box}"
                 )
 
     safe_rel = rel.replace("/", "__")
 
+    # 只保存最终选择的框
     overlay = draw_selected_overlay(img, selected_by_part)
-    sheet = make_selected_sheet(img, selected_by_part, f"{rank:03d} img_id={img_id} {rel}")
-
-    overlay_path = os.path.join(OUT, f"{rank:03d}_{safe_rel}_overlay.jpg")
-    sheet_path = os.path.join(OUT, f"{rank:03d}_{safe_rel}_sheet.jpg")
-
+    overlay_path = os.path.join(OUT, f"{rank:03d}_{safe_rel}_selected.jpg")
     overlay.save(overlay_path)
-    sheet.save(sheet_path)
 
-    print("  saved overlay:", overlay_path)
-    print("  saved sheet:", sheet_path)
+    print("  saved:", overlay_path)
 
     all_results.append({
         "rank": rank,
         "img_id": img_id,
         "relpath": rel,
-        "overlay_path": overlay_path,
-        "sheet_path": sheet_path,
+        "saved_path": overlay_path,
         "selected": selected_by_part,
         "all_candidates": all_candidates_by_part,
     })
@@ -460,17 +385,5 @@ json_path = os.path.join(OUT, "results.json")
 with open(json_path, "w") as f:
     json.dump(all_results, f, indent=2)
 
-stats_path = os.path.join(OUT, "stats.json")
-with open(stats_path, "w") as f:
-    json.dump(stats, f, indent=2)
-
-print("\n========== SUMMARY ==========")
-for part in PARTS:
-    print(f"\n{part}:")
-    print(f"  selected boxes: {stats[part]['selected']}")
-    print(f"  missing images: {stats[part]['missing']}")
-    print(f"  dropped_area: {stats[part]['dropped_area']}")
-
 print("\nDone:", OUT)
 print("JSON:", json_path)
-print("STATS:", stats_path)
