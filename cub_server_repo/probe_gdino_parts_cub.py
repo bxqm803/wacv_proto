@@ -1,27 +1,53 @@
-import os, random, inspect, json, torch, numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 
 CUB_ROOT = "./data/CUB_200_2011"
-OUT = "./runs/gdino_5img_probe_cropdetect_resize224"
-FINAL_IMAGE_SIZE = 224
+OUT = "./runs/gdino_5img_probe_prompt_ensemble"
+IMAGE_SIZE = 224
 
-BOX_THR = 0.25
-TEXT_THR = 0.20
+BOX_THR = 0.22
+TEXT_THR = 0.18
 
 SEED = 0
 NUM_IMAGES = 5
-SPLIT = "train"   # train / test / all
+SPLIT = "train"  # train / test / all
+
+USE_GT_BBOX_CROP = True
 
 PARTS = ["beak", "head", "tail", "body", "feet", "wing"]
 
 PROMPTS = {
-    "beak": "beak.",
-    "head": "head.",
-    "tail": "tail.",
-    "body": "torso.",
-    "feet": "feet.",
-    "wing": "wing.",
+    "beak": [
+        "bird beak.",
+        "bird bill.",
+        "beak of a bird.",
+    ],
+    "head": [
+        "bird head.",
+        "head of a bird.",
+    ],
+    "tail": [
+        "bird tail.",
+        "tail feathers.",
+        "bird tail feathers.",
+    ],
+    "body": [
+        "bird breast.",
+        "bird belly.",
+        "bird back.",
+    ],
+    "feet": [
+        "bird feet.",
+        "bird foot.",
+        "bird legs.",
+        "bird claws.",
+    ],
+    "wing": [
+        "bird wing.",
+        "bird wings.",
+        "left bird wing.",
+        "right bird wing.",
+    ],
 }
 
 MAX_KEEP = {
@@ -33,15 +59,37 @@ MAX_KEEP = {
     "wing": 2,
 }
 
+# 第二个框是否保留：只对 feet / wing 生效
 SECOND_BOX_MIN_SCORE = {
-    "feet": 0.18,
-    "wing": 0.18,
+    "feet": 0.16,
+    "wing": 0.16,
 }
 SECOND_BOX_REL_SCORE = {
-    "feet": 0.60,
-    "wing": 0.60,
+    "feet": 0.55,
+    "wing": 0.55,
 }
-IOU_DUP_THR = 0.85
+
+# 太像的框去重
+IOU_DUP_THR = 0.80
+
+# 防止 body/wing/head 等直接框整只鸟
+MIN_AREA = {
+    "beak": 0.0003,
+    "head": 0.002,
+    "tail": 0.002,
+    "body": 0.010,
+    "feet": 0.0005,
+    "wing": 0.004,
+}
+
+MAX_AREA = {
+    "beak": 0.25,
+    "head": 0.45,
+    "tail": 0.55,
+    "body": 0.65,
+    "feet": 0.35,
+    "wing": 0.65,
+}
 
 COLORS = {
     "beak": (255, 0, 0),
@@ -89,10 +137,12 @@ def read_bboxes(path):
 def crop_bbox(img, bbox):
     x, y, w, h = bbox
     W, H = img.size
+
     x1 = max(0, min(W - 1, int(np.floor(x))))
     y1 = max(0, min(H - 1, int(np.floor(y))))
     x2 = max(x1 + 1, min(W, int(np.ceil(x + w))))
     y2 = max(y1 + 1, min(H, int(np.ceil(y + h))))
+
     return img.crop((x1, y1, x2, y2))
 
 
@@ -102,8 +152,8 @@ def resize_only(img, size):
     return img.resize((size, size), Image.BICUBIC)
 
 
-def post_process(processor, outputs, input_ids, target_h, target_w):
-    target_sizes = torch.tensor([[target_h, target_w]], device=device)
+def post_process(processor, outputs, input_ids, image_size):
+    target_sizes = torch.tensor([[image_size, image_size]], device=device)
 
     fn = processor.post_process_grounded_object_detection
     sig = inspect.signature(fn)
@@ -158,55 +208,52 @@ def box_iou_xyxy(a, b):
     return inter / union
 
 
-def select_boxes_by_score(part, boxes, scores, crop_w, crop_h):
-    if len(boxes) == 0:
+def clamp_box(box):
+    x1, y1, x2, y2 = box
+    x1 = max(0.0, min(float(IMAGE_SIZE), float(x1)))
+    y1 = max(0.0, min(float(IMAGE_SIZE), float(y1)))
+    x2 = max(0.0, min(float(IMAGE_SIZE), float(x2)))
+    y2 = max(0.0, min(float(IMAGE_SIZE), float(y2)))
+    return [x1, y1, x2, y2]
+
+
+def box_area(box):
+    x1, y1, x2, y2 = box
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1) / float(IMAGE_SIZE * IMAGE_SIZE)
+
+
+def select_candidates(part, candidates):
+    if len(candidates) == 0:
         return []
 
-    order = torch.argsort(scores, descending=True).tolist()
-    candidates = []
+    candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
 
-    for idx in order:
-        box = boxes[idx].tolist()
-        score = float(scores[idx])
+    # 先过滤明显过大/过小的框
+    filtered = [
+        c for c in candidates
+        if MIN_AREA[part] <= c["area"] <= MAX_AREA[part]
+    ]
 
-        x1, y1, x2, y2 = box
-        x1 = max(0.0, min(float(crop_w), x1))
-        y1 = max(0.0, min(float(crop_h), y1))
-        x2 = max(0.0, min(float(crop_w), x2))
-        y2 = max(0.0, min(float(crop_h), y2))
-
-        area = max(0.0, x2 - x1) * max(0.0, y2 - y1) / float(crop_w * crop_h)
-
-        candidates.append({
-            "box_crop": [x1, y1, x2, y2],
-            "score": score,
-            "area_crop": area,
-            "prompt": PROMPTS[part],
-        })
+    # 如果过滤后全没了，回退到原始最高分
+    pool = filtered if len(filtered) > 0 else candidates
 
     max_keep = MAX_KEEP[part]
 
+    # 普通部位只保留最高分
     if max_keep == 1:
-        return candidates[:1]
+        return [pool[0]]
 
-    keep = []
-    top1 = candidates[0]
-    keep.append(top1)
+    # feet / wing：最多保留两个，但第二个要满足分数和去重条件
+    keep = [pool[0]]
+    top1_score = pool[0]["score"]
 
-    if len(candidates) == 1:
-        return keep
-
-    top1_score = top1["score"]
-    min_score = SECOND_BOX_MIN_SCORE.get(part, 0.0)
-    rel_score = SECOND_BOX_REL_SCORE.get(part, 0.0)
-
-    for cand in candidates[1:]:
+    for cand in pool[1:]:
         if len(keep) >= max_keep:
             break
 
-        cond_score_abs = cand["score"] >= min_score
-        cond_score_rel = cand["score"] >= top1_score * rel_score
-        cond_iou = box_iou_xyxy(cand["box_crop"], keep[0]["box_crop"]) < IOU_DUP_THR
+        cond_score_abs = cand["score"] >= SECOND_BOX_MIN_SCORE.get(part, 0.0)
+        cond_score_rel = cand["score"] >= top1_score * SECOND_BOX_REL_SCORE.get(part, 0.0)
+        cond_iou = all(box_iou_xyxy(cand["box"], k["box"]) < IOU_DUP_THR for k in keep)
 
         if cond_score_abs and cond_score_rel and cond_iou:
             keep.append(cand)
@@ -214,56 +261,44 @@ def select_boxes_by_score(part, boxes, scores, crop_w, crop_h):
     return keep
 
 
-def scale_detections_to_final(detections, crop_w, crop_h, final_size):
-    sx = final_size / float(crop_w)
-    sy = final_size / float(crop_h)
-
-    out = {}
-    for part, dets in detections.items():
-        scaled = []
-        for det in dets:
-            x1, y1, x2, y2 = det["box_crop"]
-            nx1 = x1 * sx
-            ny1 = y1 * sy
-            nx2 = x2 * sx
-            ny2 = y2 * sy
-
-            area = max(0.0, nx2 - nx1) * max(0.0, ny2 - ny1) / float(final_size * final_size)
-
-            scaled.append({
-                "box": [nx1, ny1, nx2, ny2],
-                "score": det["score"],
-                "area": area,
-                "prompt": det["prompt"],
-                "box_crop": det["box_crop"],
-                "area_crop": det["area_crop"],
-            })
-        out[part] = scaled
-    return out
-
-
 @torch.no_grad()
-def detect_part_on_crop(crop_img, part, processor, model):
-    inputs = processor(
-        images=crop_img,
-        text=PROMPTS[part],
-        return_tensors="pt",
-    ).to(device)
+def detect_part_prompt_ensemble(img, part, processor, model):
+    candidates = []
 
-    outputs = model(**inputs)
+    for prompt in PROMPTS[part]:
+        inputs = processor(
+            images=img,
+            text=prompt,
+            return_tensors="pt",
+        ).to(device)
 
-    result = post_process(
-        processor=processor,
-        outputs=outputs,
-        input_ids=inputs.input_ids,
-        target_h=crop_img.height,
-        target_w=crop_img.width,
-    )
+        outputs = model(**inputs)
 
-    boxes = result["boxes"].detach().cpu()
-    scores = result["scores"].detach().cpu()
+        result = post_process(
+            processor=processor,
+            outputs=outputs,
+            input_ids=inputs.input_ids,
+            image_size=IMAGE_SIZE,
+        )
 
-    return select_boxes_by_score(part, boxes, scores, crop_img.width, crop_img.height)
+        boxes = result["boxes"].detach().cpu()
+        scores = result["scores"].detach().cpu()
+
+        for box, score in zip(boxes, scores):
+            box = clamp_box(box.tolist())
+            area = box_area(box)
+
+            if area <= 0:
+                continue
+
+            candidates.append({
+                "box": box,
+                "score": float(score),
+                "area": float(area),
+                "prompt": prompt,
+            })
+
+    return select_candidates(part, candidates)
 
 
 def draw_dets(img, detections):
@@ -273,9 +308,11 @@ def draw_dets(img, detections):
 
     for part in PARTS:
         color = COLORS[part]
+
         for det in detections[part]:
             x1, y1, x2, y2 = det["box"]
             box = [int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))]
+
             draw.rectangle(box, outline=color, width=3)
             draw.text(
                 (box[0], max(0, box[1] - 12)),
@@ -287,45 +324,57 @@ def draw_dets(img, detections):
     return vis
 
 
+def draw_single_part(img, detections, part):
+    vis = img.copy()
+    draw = ImageDraw.Draw(vis)
+    font = ImageFont.load_default()
+    color = COLORS[part]
+
+    for det in detections[part]:
+        x1, y1, x2, y2 = det["box"]
+        box = [int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))]
+
+        draw.rectangle(box, outline=color, width=3)
+        draw.text(
+            (box[0], max(0, box[1] - 12)),
+            f"{part}:{det['score']:.2f},a={det['area']:.2f}",
+            fill=color,
+            font=font,
+        )
+
+    return vis
+
+
 def make_sheet(img, detections, title):
     font = ImageFont.load_default()
     panels = []
 
-    panels.append(("resized", img.copy()))
+    panels.append(("original", img.copy()))
     panels.append(("all", draw_dets(img, detections)))
 
     for part in PARTS:
-        tmp = img.copy()
-        draw = ImageDraw.Draw(tmp)
-        color = COLORS[part]
-
-        for det in detections[part]:
-            x1, y1, x2, y2 = det["box"]
-            box = [int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))]
-            draw.rectangle(box, outline=color, width=3)
-            draw.text(
-                (box[0], max(0, box[1] - 12)),
-                f"{part}:{det['score']:.2f},a={det['area']:.2f}",
-                fill=color,
-                font=font,
-            )
-
-        panels.append((part, tmp))
+        panels.append((part, draw_single_part(img, detections, part)))
 
     cols = 4
     rows = 2
     label_h = 18
     header_h = 24
 
-    canvas = Image.new("RGB", (cols * FINAL_IMAGE_SIZE, rows * (FINAL_IMAGE_SIZE + label_h) + header_h), (255, 255, 255))
+    canvas = Image.new(
+        "RGB",
+        (cols * IMAGE_SIZE, rows * (IMAGE_SIZE + label_h) + header_h),
+        (255, 255, 255),
+    )
     draw = ImageDraw.Draw(canvas)
     draw.text((4, 4), title, fill=(0, 0, 0), font=font)
 
     for i, (name, panel) in enumerate(panels):
         r = i // cols
         c = i % cols
-        x = c * FINAL_IMAGE_SIZE
-        y = header_h + r * (FINAL_IMAGE_SIZE + label_h)
+
+        x = c * IMAGE_SIZE
+        y = header_h + r * (IMAGE_SIZE + label_h)
+
         draw.text((x + 4, y + 2), name, fill=(0, 0, 0), font=font)
         canvas.paste(panel, (x, y + label_h))
 
@@ -335,7 +384,8 @@ def make_sheet(img, detections, title):
 print("device:", device)
 print("CUB_ROOT:", CUB_ROOT)
 print("OUT:", OUT)
-print("preprocess: gt_bbox_crop -> detect_on_crop -> resize_to_224_and_scale_boxes")
+print("preprocess:", "GT bbox crop -> resize 224 only -> GroundingDINO")
+print("BOX_THR:", BOX_THR, "TEXT_THR:", TEXT_THR)
 
 paths = read_kv_text(os.path.join(CUB_ROOT, "images.txt"))
 split = read_kv_int(os.path.join(CUB_ROOT, "train_test_split.txt"))
@@ -352,7 +402,9 @@ random.seed(SEED)
 ids = random.sample(candidate_ids, NUM_IMAGES)
 
 processor = AutoProcessor.from_pretrained("IDEA-Research/grounding-dino-tiny")
-model = AutoModelForZeroShotObjectDetection.from_pretrained("IDEA-Research/grounding-dino-tiny").to(device).eval()
+model = AutoModelForZeroShotObjectDetection.from_pretrained(
+    "IDEA-Research/grounding-dino-tiny"
+).to(device).eval()
 
 all_results = []
 
@@ -360,38 +412,39 @@ for rank, img_id in enumerate(ids, 1):
     rel = paths[img_id]
     img_path = os.path.join(CUB_ROOT, "images", rel)
 
-    raw_img = Image.open(img_path).convert("RGB")
-    crop_img = crop_bbox(raw_img, bboxes[img_id])
+    img = Image.open(img_path).convert("RGB")
 
-    crop_w, crop_h = crop_img.size
+    if USE_GT_BBOX_CROP:
+        img = crop_bbox(img, bboxes[img_id])
 
-    detections_crop = {}
+    # 关键：只 resize，不 center crop
+    img = resize_only(img, IMAGE_SIZE)
 
-    print(f"\n[{rank}] img_id={img_id} {rel} crop_size=({crop_w},{crop_h})")
+    detections = {}
+
+    print(f"\n[{rank}] img_id={img_id} {rel}")
 
     for part in PARTS:
-        dets = detect_part_on_crop(crop_img, part, processor, model)
-        detections_crop[part] = dets
+        dets = detect_part_prompt_ensemble(img, part, processor, model)
+        detections[part] = dets
 
         if len(dets) == 0:
             print(f"  {part}: missing")
         else:
             for k, det in enumerate(dets):
-                box = [round(x, 1) for x in det["box_crop"]]
+                box = [round(x, 1) for x in det["box"]]
                 print(
                     f"  {part}[{k}]: "
                     f"score={det['score']:.3f} "
-                    f"area_crop={det['area_crop']:.3f} "
-                    f"box_crop={box}"
+                    f"area={det['area']:.3f} "
+                    f"box={box} "
+                    f"prompt={det['prompt']}"
                 )
-
-    final_img = resize_only(crop_img, FINAL_IMAGE_SIZE)
-    detections_final = scale_detections_to_final(detections_crop, crop_w, crop_h, FINAL_IMAGE_SIZE)
 
     safe_rel = rel.replace("/", "__")
 
-    overlay = draw_dets(final_img, detections_final)
-    sheet = make_sheet(final_img, detections_final, f"{rank:03d} img_id={img_id} {rel}")
+    overlay = draw_dets(img, detections)
+    sheet = make_sheet(img, detections, f"{rank:03d} img_id={img_id} {rel}")
 
     overlay_path = os.path.join(OUT, f"{rank:03d}_{safe_rel}_overlay.jpg")
     sheet_path = os.path.join(OUT, f"{rank:03d}_{safe_rel}_sheet.jpg")
@@ -406,12 +459,9 @@ for rank, img_id in enumerate(ids, 1):
         "rank": rank,
         "img_id": img_id,
         "relpath": rel,
-        "crop_size": [crop_w, crop_h],
-        "final_size": [FINAL_IMAGE_SIZE, FINAL_IMAGE_SIZE],
         "overlay_path": overlay_path,
         "sheet_path": sheet_path,
-        "detections_crop": detections_crop,
-        "detections_final": detections_final,
+        "detections": detections,
     })
 
 json_path = os.path.join(OUT, "results.json")
