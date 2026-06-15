@@ -923,10 +923,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lambda-vis", type=float, default=cfg.lambda_vis)
     p.add_argument("--lambda-proto-lb", type=float, default=cfg.lambda_proto_lb)
     p.add_argument("--lambda-proto-div", type=float, default=cfg.lambda_proto_div)
-    p.add_argument("--lambda-cls-sparse", type=float, default=cfg.lambda_cls_sparse,
-                   help="Sparsity penalty weight on class readout weights.")
-    p.add_argument("--label-smoothing", type=float, default=cfg.label_smoothing,
-                   help="Label smoothing for the cross-entropy loss.")
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--no-resume", action="store_true")
     p.add_argument("--resume-from", choices=["last", "best", "none"], default=cfg.resume_from)
@@ -982,8 +978,6 @@ def apply_args(args: argparse.Namespace) -> None:
     cfg.lambda_vis = args.lambda_vis
     cfg.lambda_proto_lb = args.lambda_proto_lb
     cfg.lambda_proto_div = args.lambda_proto_div
-    cfg.lambda_cls_sparse = args.lambda_cls_sparse
-    cfg.label_smoothing = args.label_smoothing
     cfg.amp = not args.no_amp
     cfg.resume = not args.no_resume
     cfg.resume_from = args.resume_from
@@ -1210,8 +1204,6 @@ def main() -> None:
             "score_mode": cfg.score_mode,
             "score_scale": cfg.score_scale,
             "proto_dropout": cfg.proto_dropout,
-            "label_smoothing": cfg.label_smoothing,
-            "lambda_cls_sparse": cfg.lambda_cls_sparse,
             "readout_mode": cfg.readout_mode,
             "last_proto_score_mean": float(train_debug.get("proto_score_mean", 0.0)),
             "last_logits_std": float(train_debug.get("logits_std", 0.0)),
