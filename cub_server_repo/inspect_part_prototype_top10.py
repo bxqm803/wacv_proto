@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
-"""Inspect learned part prototypes by retrieving top images.
+"""Save top-10 images per semantic part for a selected prototype.
 
-For each semantic part, this script selects one prototype by dataset-level
-usage / score / contribution, then ranks all CUB images and exports the top-N
-images where that selected prototype is most active/contributive.
+Output layout:
+  output_dir/
+    beak/
+      rank01_....jpg
+      ...
+    head/
+    wing/
+    body/
+    tail/
+    feet/
 
-It imports the training script so dataset/model definitions stay identical.
+Each saved image shows:
+  - the resized bird crop used by the model
+  - the selected part GDINO bbox in red
+  - the strongest prototype patch in yellow (optional)
+  - a small text tag with rank / value / prototype id / label / pred
 """
 
 import argparse
-import csv
-import html
 import importlib.util
-import json
-import math
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -24,9 +31,6 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-
-IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
 def import_train_module(path: str):
@@ -40,40 +44,36 @@ def import_train_module(path: str):
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser("Inspect top images for learned part prototypes")
-    p.add_argument("--train-script", default="./train_cub_shared_part_proto_finetune_reg.py",
-                   help="Training script containing CFG / Dataset / Model definitions.")
-    p.add_argument("--ckpt", required=True, help="Path to trained best.pth / last.pth checkpoint.")
+    p = argparse.ArgumentParser("Save per-part top prototype images only")
+    p.add_argument("--train-script", default="./train_cub_shared_part_proto_finetune_reg.py")
+    p.add_argument("--ckpt", required=True)
     p.add_argument("--cub-root", default=os.environ.get("CUB_ROOT", "./data/CUB_200_2011"))
     p.add_argument("--gdino-box-dir", default="./artifacts/gdino_part_boxes_gtbbox_warp224_sep")
     p.add_argument("--gdino-train-file", default="train_part_boxes_gtbbox_warp518.pt")
     p.add_argument("--gdino-test-file", default="test_part_boxes_gtbbox_warp518.pt")
-    p.add_argument("--output-dir", default="./runs/proto_top10_inspect")
+    p.add_argument("--output-dir", default="./runs/proto_top10_images")
     p.add_argument("--dino-model", default="dinov2_vitb14")
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument("--parts", default="beak,head,wing,body,tail,feet")
     p.add_argument("--k-per-part", type=int, default=50)
     p.add_argument("--score-mode", default="resp_sum",
-                   choices=["resp_sum", "scan_max", "scan_topk", "part_max", "part_topk"],
-                   help="How to compute proto_score during inspection. For old checkpoints, resp_sum is usually correct.")
+                   choices=["resp_sum", "scan_max", "scan_topk", "part_max", "part_topk"])
     p.add_argument("--score-scale", type=float, default=8.0)
     p.add_argument("--scan-topk", type=int, default=5)
     p.add_argument("--readout-mode", default="nonneg", choices=["nonneg", "signed"])
     p.add_argument("--select-by", default="usage", choices=["usage", "score", "contribution"],
-                   help="Dataset-level criterion used to choose one prototype per part.")
+                   help="How to choose one prototype per part.")
     p.add_argument("--rank-by", default="score", choices=["usage", "score", "contribution"],
-                   help="Per-image criterion used to rank top-N images for the selected prototype.")
-    p.add_argument("--contribution-class", default="pred", choices=["pred", "true"],
-                   help="For contribution metrics, use contribution to predicted class or ground-truth class.")
-    p.add_argument("--contribution-abs", action="store_true",
-                   help="Rank/select by absolute contribution. Mainly useful for signed readout.")
-    p.add_argument("--splits", default="train,test", help="Comma-separated splits to scan: train,test")
+                   help="How to rank top images once the prototype is chosen.")
+    p.add_argument("--contribution-class", default="pred", choices=["pred", "true"])
+    p.add_argument("--contribution-abs", action="store_true")
+    p.add_argument("--splits", default="train,test")
     p.add_argument("--top-n", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--no-amp", action="store_true")
-    p.add_argument("--draw-top-patch", action="store_true",
-                   help="Also draw the strongest patch location for the prototype.")
+    p.add_argument("--no-draw-top-patch", action="store_true",
+                   help="Do not draw the strongest patch location.")
     return p.parse_args()
 
 
@@ -94,7 +94,6 @@ def configure_module(mod, args: argparse.Namespace) -> None:
     cfg.batch_size = args.batch_size
     cfg.num_workers = args.num_workers
     cfg.amp = not args.no_amp
-    # Avoid accidental training-time options affecting inspection.
     if hasattr(cfg, "proto_dropout"):
         cfg.proto_dropout = 0.0
     if hasattr(cfg, "resume"):
@@ -144,10 +143,6 @@ def build_model_and_load(mod, args: argparse.Namespace, train_ds) -> torch.nn.Mo
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing or unexpected:
         print(f"[Load] missing keys={len(missing)} unexpected keys={len(unexpected)}")
-        if len(missing) < 20:
-            print("  missing:", missing)
-        if len(unexpected) < 20:
-            print("  unexpected:", unexpected)
     print(f"[Load] checkpoint={args.ckpt}")
     model.eval()
     return model
@@ -204,12 +199,10 @@ def draw_sample_image(
     draw = ImageDraw.Draw(img)
     font = ImageFont.load_default()
 
-    # Draw GDINO part box.
     box = ds.boxes[local_idx, part_idx].cpu().numpy().astype(float).tolist()
     if box[0] >= 0 and box[2] > box[0] and box[3] > box[1]:
         draw.rectangle(box, outline=(255, 0, 0), width=3)
 
-    # Draw strongest token/patch for this prototype.
     if draw_top_patch and top_patch >= 0:
         h, w = grid_hw
         r = int(top_patch) // w
@@ -221,8 +214,7 @@ def draw_sample_image(
 
     label_name = class_names.get(label, str(label))
     pred_name = class_names.get(pred, str(pred))
-    text = f"{split} | {mod.cfg.parts[part_idx]} k={proto_idx} | v={value:.4g}\nlabel={label_name}\npred={pred_name}"
-    # background for text
+    text = f"r={Path(out_path).stem[:6]} | {mod.cfg.parts[part_idx]} k={proto_idx} | v={value:.4g}\nlabel={label_name}\npred={pred_name}"
     lines = text.split("\n")
     tw = max(draw.textlength(line, font=font) for line in lines) + 6
     th = 12 * len(lines) + 6
@@ -231,33 +223,13 @@ def draw_sample_image(
     img.save(out_path, quality=95)
 
 
-def make_contact_sheet(image_paths: List[str], out_path: str, thumb: int = 224, cols: int = 5) -> None:
-    if not image_paths:
-        return
-    rows = int(math.ceil(len(image_paths) / cols))
-    sheet = Image.new("RGB", (cols * thumb, rows * thumb), (255, 255, 255))
-    for i, path in enumerate(image_paths):
-        im = Image.open(path).convert("RGB").resize((thumb, thumb), Image.BICUBIC)
-        x = (i % cols) * thumb
-        y = (i // cols) * thumb
-        sheet.paste(im, (x, y))
-    sheet.save(out_path, quality=95)
-
-
 def main() -> None:
     args = parse_args()
     mod = import_train_module(args.train_script)
     configure_module(mod, args)
     device = mod.DEVICE
     out_dir = Path(args.output_dir)
-    img_dir = out_dir / "top_images"
-    sheet_dir = out_dir / "contact_sheets"
     out_dir.mkdir(parents=True, exist_ok=True)
-    img_dir.mkdir(parents=True, exist_ok=True)
-    sheet_dir.mkdir(parents=True, exist_ok=True)
-
-    with open(out_dir / "inspect_config.json", "w", encoding="utf-8") as f:
-        json.dump(vars(args), f, indent=2)
 
     split_names = [x.strip() for x in args.splits.split(",") if x.strip()]
     datasets = {}
@@ -291,18 +263,17 @@ def main() -> None:
                 out = model(images)
             logits = out["logits"].float()
             pred = logits.argmax(dim=1)
-            score = out["proto_score"].detach().float()          # B,P,K
-            usage = out["utilization"].detach().float()          # B,P,K
-            cw = out["class_weight"].detach().float()             # C,P,K
+            score = out["proto_score"].detach().float()
+            usage = out["utilization"].detach().float()
+            cw = out["class_weight"].detach().float()
             cls = pred if args.contribution_class == "pred" else y
-            contrib = score * cw[cls]                              # B,P,K
+            contrib = score * cw[cls]
             if args.contribution_abs:
                 contrib = contrib.abs()
 
-            # strongest part-gated patch location for visual reference
-            relu_sim = F.relu(out["sim"].detach().float())         # B,P,N,K
+            relu_sim = F.relu(out["sim"].detach().float())
             gated = out["part_map"].detach().float().unsqueeze(-1) * relu_sim
-            patch = gated.argmax(dim=2).to(torch.int16)             # B,P,K
+            patch = gated.argmax(dim=2).to(torch.int16)
             if grid_hw is None:
                 grid_hw = (int(out["grid_h"].item()), int(out["grid_w"].item()))
 
@@ -327,35 +298,24 @@ def main() -> None:
     usage = np.concatenate(all_usage, axis=0)
     contrib = np.concatenate(all_contrib, axis=0)
     patch_ids = np.concatenate(all_patch, axis=0)
+
     select_metric = as_metric_array(args.select_by, scores, usage, contrib)
     rank_metric = as_metric_array(args.rank_by, scores, usage, contrib)
-
-    # Choose one prototype per part.
     agg = select_metric.sum(axis=0)  # P,K
     chosen_k = agg.argmax(axis=1).astype(int)
 
-    part_rows = []
-    top_rows = []
-    html_blocks = []
     top_n = int(args.top_n)
     parts = list(mod.cfg.parts)
+    draw_top_patch = not args.no_draw_top_patch
 
     for p_idx, part in enumerate(parts):
         k_idx = int(chosen_k[p_idx])
-        part_rows.append({
-            "part": part,
-            "chosen_proto_k": k_idx,
-            "select_by": args.select_by,
-            "select_metric_sum": float(agg[p_idx, k_idx]),
-            "usage_sum": float(usage[:, p_idx, k_idx].sum()),
-            "score_sum": float(scores[:, p_idx, k_idx].sum()),
-            "contribution_sum": float(contrib[:, p_idx, k_idx].sum()),
-        })
+        part_dir = out_dir / part
+        part_dir.mkdir(parents=True, exist_ok=True)
 
         vals = rank_metric[:, p_idx, k_idx]
         order = np.argsort(-vals)[:top_n]
-        image_paths = []
-        html_items = []
+
         for rank, global_idx in enumerate(order, start=1):
             m = meta[int(global_idx)]
             split = m["split"]
@@ -364,63 +324,18 @@ def main() -> None:
             value = float(vals[global_idx])
             patch_id = int(patch_ids[global_idx, p_idx, k_idx])
             safe_rel = m["relpath"].replace("/", "__").replace(" ", "_")
-            img_name = f"{part}_k{k_idx:03d}_rank{rank:02d}_{split}_{safe_rel}.jpg"
-            img_path = img_dir / img_name
+            img_name = f"rank{rank:02d}_proto{k_idx:03d}_{split}_{safe_rel}.jpg"
+            img_path = part_dir / img_name
             draw_sample_image(
                 mod, ds, local_idx, p_idx, k_idx, value, split,
                 int(m["pred"]), int(m["label"]), class_names,
-                patch_id, grid_hw or (16, 16), str(img_path), args.draw_top_patch,
+                patch_id, grid_hw or (16, 16), str(img_path), draw_top_patch,
             )
-            image_paths.append(str(img_path))
-            html_items.append(f'<div><img src="top_images/{html.escape(img_name)}" width="224"><br>{rank}. {html.escape(m["relpath"])}<br>v={value:.5f}</div>')
-            top_rows.append({
-                "part": part,
-                "chosen_proto_k": k_idx,
-                "rank": rank,
-                "rank_by": args.rank_by,
-                "value": value,
-                "split": split,
-                "relpath": m["relpath"],
-                "label": int(m["label"]),
-                "label_name": class_names.get(int(m["label"]), str(m["label"])),
-                "pred": int(m["pred"]),
-                "pred_name": class_names.get(int(m["pred"]), str(m["pred"])),
-                "score": float(scores[global_idx, p_idx, k_idx]),
-                "usage": float(usage[global_idx, p_idx, k_idx]),
-                "contribution": float(contrib[global_idx, p_idx, k_idx]),
-                "top_patch": patch_id,
-            })
-        sheet_path = sheet_dir / f"{part}_k{k_idx:03d}_top{top_n}.jpg"
-        make_contact_sheet(image_paths, str(sheet_path))
-        html_blocks.append(
-            f"<h2>{html.escape(part)} | proto k={k_idx}</h2>"
-            f"<p>select_by={html.escape(args.select_by)}, rank_by={html.escape(args.rank_by)}</p>"
-            f"<img src='contact_sheets/{html.escape(sheet_path.name)}' width='1120'>"
-            f"<div style='display:grid;grid-template-columns:repeat(5,224px);gap:8px'>{''.join(html_items)}</div>"
-        )
 
-    with open(out_dir / "chosen_prototypes.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(part_rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(part_rows)
-
-    with open(out_dir / "top10_rows.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(top_rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(top_rows)
-
-    with open(out_dir / "index.html", "w", encoding="utf-8") as f:
-        f.write("<html><head><meta charset='utf-8'><title>Prototype Top Images</title></head><body>")
-        f.write(f"<h1>Prototype top-{top_n} inspection</h1>")
-        f.write(f"<p>ckpt={html.escape(args.ckpt)}<br>select_by={html.escape(args.select_by)}; rank_by={html.escape(args.rank_by)}; contribution_class={html.escape(args.contribution_class)}</p>")
-        f.write("\n".join(html_blocks))
-        f.write("</body></html>")
+        print(f"[Saved] {part}: proto k={k_idx} -> {part_dir}")
 
     print("[Done]")
-    print(f"  chosen prototypes: {out_dir / 'chosen_prototypes.csv'}")
-    print(f"  top rows:          {out_dir / 'top10_rows.csv'}")
-    print(f"  html:              {out_dir / 'index.html'}")
-    print(f"  contact sheets:    {sheet_dir}")
+    print(f"Images saved under: {out_dir}")
 
 
 if __name__ == "__main__":
