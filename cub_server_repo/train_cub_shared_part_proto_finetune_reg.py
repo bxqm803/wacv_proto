@@ -304,7 +304,89 @@ def _parse_one_sample_part_boxes(elem: Any, parts_in_file: List[str]) -> np.ndar
     return out
 
 
+NEW_GDINO_PART_ORDER = ("beak", "head", "tail", "body", "feet", "wing")
+
+
+def _merge_xyxy_boxes_to_one(boxes: Any) -> torch.Tensor:
+    """Merge one part's selected boxes into a single xyxy box.
+
+    New GDINO output stores selected_boxes_xyxy as nested lists:
+      [image][part][num_selected][4]
+    Feet/wing may have two boxes. The training code expects one box per part,
+    so we use the union box. Empty/invalid -> -1.
+    """
+    if boxes is None:
+        return torch.full((4,), -1.0, dtype=torch.float32)
+    if isinstance(boxes, torch.Tensor):
+        arr = boxes.detach().cpu().float()
+    else:
+        try:
+            arr = torch.as_tensor(boxes, dtype=torch.float32)
+        except Exception:
+            return torch.full((4,), -1.0, dtype=torch.float32)
+
+    if arr.numel() == 0:
+        return torch.full((4,), -1.0, dtype=torch.float32)
+    if arr.ndim == 1 and arr.numel() == 4:
+        arr = arr.view(1, 4)
+    elif arr.ndim >= 2 and arr.shape[-1] == 4:
+        arr = arr.reshape(-1, 4)
+    else:
+        return torch.full((4,), -1.0, dtype=torch.float32)
+
+    valid = (arr[:, 0] >= 0) & (arr[:, 2] > arr[:, 0]) & (arr[:, 3] > arr[:, 1])
+    if not bool(valid.any()):
+        return torch.full((4,), -1.0, dtype=torch.float32)
+    v = arr[valid]
+    return torch.tensor(
+        [v[:, 0].min(), v[:, 1].min(), v[:, 2].max(), v[:, 3].max()],
+        dtype=torch.float32,
+    )
+
+
+def _load_visible_resize224_selected_boxes(gd: Dict[str, Any], parts_in_file: List[str]) -> torch.Tensor:
+    """Load the new visible-resize224 GDINO format.
+
+    Expected keys:
+      img_ids
+      relpaths
+      visible_parts               # [N,6], fixed order
+      selected_boxes_xyxy         # [N,6,K,4] as nested lists
+      selected_scores
+      selected_areas
+      raw_candidate_counts
+
+    Fixed part order in the new file:
+      ["beak", "head", "tail", "body", "feet", "wing"]
+    """
+    selected = gd["selected_boxes_xyxy"]
+    visible = gd.get("visible_parts", None)
+    n = len(selected)
+    p_need = len(parts_in_file)
+    out = torch.full((n, p_need, 4), -1.0, dtype=torch.float32)
+
+    for i in range(n):
+        for p in range(p_need):
+            is_visible = True
+            if visible is not None:
+                try:
+                    is_visible = bool(visible[i][p])
+                except Exception:
+                    is_visible = True
+            if not is_visible:
+                continue
+            try:
+                elem = selected[i][p]
+            except Exception:
+                continue
+            out[i, p] = _merge_xyxy_boxes_to_one(elem)
+    return out
+
+
 def _load_gdino_part_boxes_tensor(gd: Dict[str, Any], parts_in_file: List[str]) -> torch.Tensor:
+    if "selected_boxes_xyxy" in gd:
+        return _load_visible_resize224_selected_boxes(gd, parts_in_file)
+
     pb = gd["part_boxes_xyxy_pix"]
     p_need = len(parts_in_file)
     if isinstance(pb, torch.Tensor):
@@ -339,11 +421,25 @@ def _load_gdino_part_boxes_tensor(gd: Dict[str, Any], parts_in_file: List[str]) 
 
 def load_aligned_part_boxes(samples: List[Dict[str, Any]], gdino_path: str, model_image_size: int) -> torch.Tensor:
     gd = torch.load(gdino_path, map_location="cpu")
-    if "relpaths" not in gd or "part_boxes_xyxy_pix" not in gd:
-        raise KeyError(f"Bad GDINO cache: {gdino_path}")
-    src_size = int(gd.get("img_size", model_image_size))
+
+    if "relpaths" not in gd:
+        raise KeyError(f"Bad GDINO cache: missing relpaths in {gdino_path}")
+
+    is_new_visible_format = "selected_boxes_xyxy" in gd
+    if not is_new_visible_format and "part_boxes_xyxy_pix" not in gd:
+        raise KeyError(f"Bad GDINO cache: missing part box key in {gdino_path}")
+
+    if is_new_visible_format:
+        # New builder output has fixed order:
+        # ["beak", "head", "tail", "body", "feet", "wing"]
+        parts_in_file = [str(x).lower() for x in gd.get("parts", list(NEW_GDINO_PART_ORDER))]
+        src_size = int(gd.get("image_size", gd.get("img_size", model_image_size)))
+        print(f"[GDINO] detected visible-resize format; parts_in_file={parts_in_file}")
+    else:
+        parts_in_file = [str(x).lower() for x in gd.get("parts", list(DEFAULT_PARTS))]
+        src_size = int(gd.get("img_size", model_image_size))
+
     scale = float(model_image_size) / float(src_size)
-    parts_in_file = [str(x).lower() for x in gd.get("parts", list(DEFAULT_PARTS))]
     boxes_pf = _load_gdino_part_boxes_tensor(gd, parts_in_file)
     relpaths = [str(x) for x in gd["relpaths"]]
     gd_index = {rp: i for i, rp in enumerate(relpaths)}
@@ -378,14 +474,23 @@ def load_aligned_part_boxes(samples: List[Dict[str, Any]], gdino_path: str, mode
 
     out = torch.full((len(samples), len(cfg.parts), 4), -1.0, dtype=torch.float32)
     missing = 0
+    valid_count = 0
     for i, s in enumerate(samples):
         j = gd_index.get(str(s["relpath"]))
         if j is None:
             missing += 1
         else:
             out[i] = merged_src[j] * scale
-    print(f"[GDINO] {os.path.basename(gdino_path)} aligned={len(samples)-missing}/{len(samples)} missing={missing}")
+            valid_count += int(((out[i, :, 0] >= 0) & (out[i, :, 2] > out[i, :, 0]) & (out[i, :, 3] > out[i, :, 1])).sum().item())
+
+    total_parts = max(1, len(samples) * len(cfg.parts))
+    print(
+        f"[GDINO] {os.path.basename(gdino_path)} aligned={len(samples)-missing}/{len(samples)} "
+        f"missing_images={missing} valid_part_boxes={valid_count}/{total_parts} "
+        f"src_size={src_size} model_size={model_image_size}"
+    )
     return out
+
 
 
 class CUBImageWithPartBoxes(Dataset):
