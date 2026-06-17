@@ -113,7 +113,7 @@ class CFG:
 
     # Loss weights.
     label_smoothing: float = 0.0
-    lambda_ce: float = 1.0
+    lambda_ce: float = 2.0
     lambda_route: float = 0.2
     route_final_ratio: float = 0.1
     route_decay_epochs: int = 20
