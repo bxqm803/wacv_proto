@@ -18,11 +18,6 @@ responsibility-weighted EMA + semantic injection from part boxes.  The part
 boxes are only used for route/EMA supervision; by default prototype scoring is
 not hard-masked by boxes.
 
-This version adds prototype-part agreement: part queries localize semantic
-parts, prototypes match within-part appearance modes, and an agreement loss
-keeps prototype activation maps spatially consistent with their corresponding
-part maps.
-
 Expected geometry:
   raw CUB image -> CUB GT bird bbox crop -> resize/warp to 224x224.
   GroundingDINO boxes should be generated on the same crop geometry, possibly
@@ -59,9 +54,9 @@ DEFAULT_PARTS = ("beak", "head", "wing", "body", "tail", "feet")
 @dataclass
 class CFG:
     cub_root: str = "./data/CUB_200_2011"
-    gdino_box_dir: str = "./artifacts/gdino_part_boxes_visible_resize224"
-    gdino_train_file: str = "train_part_boxes_visible_resize224.pt"
-    gdino_test_file: str = "test_part_boxes_visible_resize224.pt"
+    gdino_box_dir: str = "./artifacts/gdino_part_boxes_gtbbox_warp518"
+    gdino_train_file: str = "train_part_boxes_gtbbox_warp518.pt"
+    gdino_test_file: str = "test_part_boxes_gtbbox_warp518.pt"
     save_dir: str = "./runs/shared_part_proto_finetune"
 
     # DINOv2 torch.hub name.  Common options: dinov2_vits14, dinov2_vitb14.
@@ -80,8 +75,6 @@ class CFG:
     # resp_sum: original responsibility-weighted evidence.
     # scan_max: full-image prototype scan max, no part-box mask.
     # scan_topk: average top-k full-image prototype responses.
-    # part_max: part-gated max prototype response.
-    # part_topk: average top-k part-gated prototype responses.
     score_mode: str = "resp_sum"
     # Important for resp_sum: part_map and proto softmax make evidence small.
     # This only calibrates logit scale; it does not change evidence attribution.
@@ -104,7 +97,6 @@ class CFG:
     ema_sem_mix: float = 0.50
     ema_min_mass: float = 1e-3
     ema_start_epoch: int = 1
-    ema_stop_epoch: int = 0  # 0 means never stop EMA
     ema_every_steps: int = 1
 
     # Part-box target.
@@ -113,17 +105,12 @@ class CFG:
 
     # Loss weights.
     label_smoothing: float = 0.0
-    lambda_ce: float = 2.0
+    lambda_ce: float = 1.0
     lambda_route: float = 0.2
     route_final_ratio: float = 0.1
     route_decay_epochs: int = 20
     lambda_vis: float = 0.01
     lambda_proto_lb: float = 0.005
-    lambda_proto_agree: float = 0.05
-    # proto_to_part: KL(stopgrad(proto_map) || part_map), updates the part router.
-    # part_to_proto: KL(stopgrad(part_map) || proto_map), updates prototype activation.
-    # symmetric: average of both directions.
-    proto_agree_direction: str = "symmetric"
     lambda_proto_div: float = 0.01
     proto_div_margin: float = 0.30
     lambda_cls_sparse: float = 1e-5
@@ -314,188 +301,47 @@ def _parse_one_sample_part_boxes(elem: Any, parts_in_file: List[str]) -> np.ndar
     return out
 
 
-NEW_GDINO_PART_ORDER = ("beak", "head", "tail", "body", "feet", "wing")
-
-
-def _infer_gdino_parts(gd: Dict[str, Any]) -> List[str]:
-    """Infer part order stored in a GDINO cache."""
-    if "parts" in gd:
-        return [str(x).lower() for x in gd["parts"]]
-
-    if isinstance(gd.get("prompts", None), dict):
-        # New visible-resize224 cache produced by build_gdino_part_boxes_visible_resize224.py.
-        # Python preserves dict insertion order, so this recovers the builder order:
-        # beak, head, tail, body, feet, wing.
-        return [str(x).lower() for x in gd["prompts"].keys()]
-
-    if "selected_boxes_xyxy" in gd:
-        return list(NEW_GDINO_PART_ORDER)
-
-    return list(DEFAULT_PARTS)
-
-
-def _valid_xyxy_np(raw: Any) -> np.ndarray:
-    """Return valid xyxy boxes as [M,4] float32; invalid / empty -> [0,4]."""
-    if raw is None:
-        return np.zeros((0, 4), dtype=np.float32)
-
-    try:
-        if isinstance(raw, torch.Tensor):
-            arr = raw.detach().cpu().float().numpy()
-        else:
-            arr = np.asarray(raw, dtype=np.float32)
-    except Exception:
-        return np.zeros((0, 4), dtype=np.float32)
-
-    if arr.size == 0:
-        return np.zeros((0, 4), dtype=np.float32)
-
-    if arr.ndim == 1 and arr.size == 4:
-        arr = arr.reshape(1, 4)
-    elif arr.ndim >= 2 and arr.shape[-1] == 4:
-        arr = arr.reshape(-1, 4)
-    else:
-        return np.zeros((0, 4), dtype=np.float32)
-
-    valid = (
-        (arr[:, 0] >= 0)
-        & (arr[:, 2] > arr[:, 0])
-        & (arr[:, 3] > arr[:, 1])
-    )
-    return arr[valid].astype(np.float32)
-
-
-def _max_boxes_in_selected(selected: Any) -> int:
-    max_m = 1
-    if not isinstance(selected, (list, tuple)):
-        return max_m
-
-    for image_parts in selected:
-        if not isinstance(image_parts, (list, tuple)):
-            continue
-        for part_boxes in image_parts:
-            arr = _valid_xyxy_np(part_boxes)
-            max_m = max(max_m, int(arr.shape[0]))
-
-    return max_m
-
-
 def _load_gdino_part_boxes_tensor(gd: Dict[str, Any], parts_in_file: List[str]) -> torch.Tensor:
-    """Load GDINO cache into [N_file, P_file, M, 4].
-
-    Supports:
-      new format: selected_boxes_xyxy = [N][P][M][4], visible_parts = [N][P]
-      old format: part_boxes_xyxy_pix = tensor/list with [N,P,4] or [N,P,M,4]
-    """
-    p_need = len(parts_in_file)
-
-    if "selected_boxes_xyxy" in gd:
-        selected = gd["selected_boxes_xyxy"]
-        visible = gd.get("visible_parts", None)
-        if not isinstance(selected, (list, tuple)):
-            raise TypeError(f"selected_boxes_xyxy must be list/tuple, got {type(selected)}")
-
-        max_m = _max_boxes_in_selected(selected)
-        out = torch.full((len(selected), p_need, max_m, 4), -1.0, dtype=torch.float32)
-
-        for i, image_parts in enumerate(selected):
-            if not isinstance(image_parts, (list, tuple)):
-                continue
-
-            for p in range(min(p_need, len(image_parts))):
-                is_visible = True
-                if visible is not None:
-                    try:
-                        is_visible = bool(visible[i][p])
-                    except Exception:
-                        is_visible = True
-                if not is_visible:
-                    continue
-
-                arr = _valid_xyxy_np(image_parts[p])
-                if arr.shape[0] == 0:
-                    continue
-
-                m = min(max_m, arr.shape[0])
-                out[i, p, :m] = torch.from_numpy(arr[:m])
-
-        return out
-
-    if "part_boxes_xyxy_pix" not in gd:
-        raise KeyError(
-            "Bad GDINO cache: expected either 'selected_boxes_xyxy' "
-            "or 'part_boxes_xyxy_pix'."
-        )
-
     pb = gd["part_boxes_xyxy_pix"]
-
+    p_need = len(parts_in_file)
     if isinstance(pb, torch.Tensor):
         pb = pb.float()
         if pb.ndim == 3 and pb.shape[-1] == 4:
-            out = torch.full((pb.shape[0], p_need, 1, 4), -1.0, dtype=torch.float32)
-            m = min(p_need, pb.shape[1])
-            out[:, :m, 0, :] = pb[:, :m, :]
+            out = torch.full((pb.shape[0], p_need, 4), -1.0, dtype=torch.float32)
+            out[:, : min(p_need, pb.shape[1])] = pb[:, : min(p_need, pb.shape[1])]
             return out
-
         if pb.ndim == 4 and pb.shape[-1] == 4:
             b = pb.reshape(pb.shape[0], pb.shape[1], -1, 4)
-            out = torch.full((b.shape[0], p_need, b.shape[2], 4), -1.0, dtype=torch.float32)
-            m = min(p_need, b.shape[1])
-            out[:, :m, :, :] = b[:, :m, :, :]
+            valid = (b[..., 0] >= 0) & (b[..., 2] > b[..., 0]) & (b[..., 3] > b[..., 1])
+            big = torch.tensor(1e9, dtype=torch.float32)
+            neg = torch.tensor(-1e9, dtype=torch.float32)
+            x1 = torch.where(valid, b[..., 0], big).min(dim=2).values
+            y1 = torch.where(valid, b[..., 1], big).min(dim=2).values
+            x2 = torch.where(valid, b[..., 2], neg).max(dim=2).values
+            y2 = torch.where(valid, b[..., 3], neg).max(dim=2).values
+            any_valid = valid.any(dim=2)
+            merged = torch.stack([x1, y1, x2, y2], dim=-1)
+            merged[~any_valid] = -1.0
+            out = torch.full((pb.shape[0], p_need, 4), -1.0, dtype=torch.float32)
+            out[:, : min(p_need, merged.shape[1])] = merged[:, : min(p_need, merged.shape[1])]
             return out
-
         raise ValueError(f"Unexpected part box tensor shape: {tuple(pb.shape)}")
-
     if isinstance(pb, (list, tuple)):
-        parsed: List[List[np.ndarray]] = []
-        max_m = 1
-
-        for elem in pb:
-            cur: List[np.ndarray] = []
-            for p in range(p_need):
-                arr = np.zeros((0, 4), dtype=np.float32)
-
-                if isinstance(elem, dict):
-                    name = parts_in_file[p]
-                    arr = _valid_xyxy_np(elem.get(name, None))
-                elif isinstance(elem, (list, tuple)) and p < len(elem):
-                    arr = _valid_xyxy_np(elem[p])
-                else:
-                    raw = _valid_xyxy_np(elem)
-                    if raw.shape[0] > p:
-                        arr = raw[p:p+1]
-
-                max_m = max(max_m, int(arr.shape[0]))
-                cur.append(arr)
-
-            parsed.append(cur)
-
-        out = torch.full((len(parsed), p_need, max_m, 4), -1.0, dtype=torch.float32)
-        for i, cur in enumerate(parsed):
-            for p, arr in enumerate(cur):
-                if arr.shape[0] == 0:
-                    continue
-                m = min(max_m, arr.shape[0])
-                out[i, p, :m] = torch.from_numpy(arr[:m])
+        out = torch.full((len(pb), p_need, 4), -1.0, dtype=torch.float32)
+        for i, elem in enumerate(pb):
+            out[i] = torch.from_numpy(_parse_one_sample_part_boxes(elem, parts_in_file))
         return out
-
-    raise TypeError(f"Unsupported GDINO box container: {type(pb)}")
+    raise TypeError(f"Unsupported part_boxes_xyxy_pix container: {type(pb)}")
 
 
 def load_aligned_part_boxes(samples: List[Dict[str, Any]], gdino_path: str, model_image_size: int) -> torch.Tensor:
     gd = torch.load(gdino_path, map_location="cpu")
-
-    if "relpaths" not in gd:
-        raise KeyError(f"Bad GDINO cache: missing relpaths in {gdino_path}")
-
-    is_new_visible_format = "selected_boxes_xyxy" in gd
-    parts_in_file = _infer_gdino_parts(gd)
-    src_size = int(gd.get("image_size", gd.get("img_size", model_image_size)))
+    if "relpaths" not in gd or "part_boxes_xyxy_pix" not in gd:
+        raise KeyError(f"Bad GDINO cache: {gdino_path}")
+    src_size = int(gd.get("img_size", model_image_size))
     scale = float(model_image_size) / float(src_size)
-
+    parts_in_file = [str(x).lower() for x in gd.get("parts", list(DEFAULT_PARTS))]
     boxes_pf = _load_gdino_part_boxes_tensor(gd, parts_in_file)
-    # [N_file, P_file, M_file, 4]
-
     relpaths = [str(x) for x in gd["relpaths"]]
     gd_index = {rp: i for i, rp in enumerate(relpaths)}
 
@@ -509,55 +355,34 @@ def load_aligned_part_boxes(samples: List[Dict[str, Any]], gdino_path: str, mode
             return [i for i, n in enumerate(parts_in_file) if "feet" in n or "foot" in n or "leg" in n]
         return [i for i, n in enumerate(parts_in_file) if n == t]
 
-    matched: List[List[int]] = []
-    max_match = 1
-    for part_name in cfg.parts:
+    merged_src = torch.full((boxes_pf.shape[0], len(cfg.parts), 4), -1.0, dtype=torch.float32)
+    for p, part_name in enumerate(cfg.parts):
         idxs = match_indices(part_name)
-        matched.append(idxs)
-        max_match = max(max_match, len(idxs))
-
-    max_boxes_per_part = max(1, boxes_pf.shape[2] * max_match)
-    aligned_src = torch.full(
-        (boxes_pf.shape[0], len(cfg.parts), max_boxes_per_part, 4),
-        -1.0,
-        dtype=torch.float32,
-    )
-
-    for p, idxs in enumerate(matched):
         if not idxs:
             continue
-        bx = boxes_pf[:, idxs, :, :].reshape(boxes_pf.shape[0], -1, 4)
-        m = min(max_boxes_per_part, bx.shape[1])
-        aligned_src[:, p, :m, :] = bx[:, :m, :]
+        bx = boxes_pf[:, idxs, :]
+        valid = (bx[..., 0] >= 0) & (bx[..., 2] > bx[..., 0]) & (bx[..., 3] > bx[..., 1])
+        big = torch.tensor(1e9, dtype=torch.float32)
+        neg = torch.tensor(-1e9, dtype=torch.float32)
+        x1 = torch.where(valid, bx[..., 0], big).min(dim=1).values
+        y1 = torch.where(valid, bx[..., 1], big).min(dim=1).values
+        x2 = torch.where(valid, bx[..., 2], neg).max(dim=1).values
+        y2 = torch.where(valid, bx[..., 3], neg).max(dim=1).values
+        any_valid = valid.any(dim=1)
+        merged = torch.stack([x1, y1, x2, y2], dim=1)
+        merged[~any_valid] = -1.0
+        merged_src[:, p] = merged
 
-    out = torch.full(
-        (len(samples), len(cfg.parts), max_boxes_per_part, 4),
-        -1.0,
-        dtype=torch.float32,
-    )
-
+    out = torch.full((len(samples), len(cfg.parts), 4), -1.0, dtype=torch.float32)
     missing = 0
     for i, s in enumerate(samples):
         j = gd_index.get(str(s["relpath"]))
         if j is None:
             missing += 1
-            continue
-        out[i] = aligned_src[j] * scale
-
-    valid = (out[..., 0] >= 0) & (out[..., 2] > out[..., 0]) & (out[..., 3] > out[..., 1])
-    valid_part_ratio = valid.any(dim=-1).float().mean().item()
-
-    print(
-        f"[GDINO] {os.path.basename(gdino_path)} "
-        f"format={'selected_boxes_xyxy' if is_new_visible_format else 'part_boxes_xyxy_pix'} "
-        f"src_size={src_size} model_size={model_image_size} scale={scale:.4f} "
-        f"parts_in_file={parts_in_file} "
-        f"aligned={len(samples)-missing}/{len(samples)} missing_images={missing} "
-        f"valid_part_ratio={valid_part_ratio:.4f} "
-        f"max_boxes_per_part={max_boxes_per_part}"
-    )
+        else:
+            out[i] = merged_src[j] * scale
+    print(f"[GDINO] {os.path.basename(gdino_path)} aligned={len(samples)-missing}/{len(samples)} missing={missing}")
     return out
-
 
 
 class CUBImageWithPartBoxes(Dataset):
@@ -601,74 +426,42 @@ def make_loader(ds: Dataset, train: bool) -> DataLoader:
 # Part boxes -> token distributions
 # -----------------------------
 def boxes_to_soft_q(boxes: torch.Tensor, h: int, w: int, image_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Convert part boxes to token-level soft targets.
-
-    Supports:
-      boxes [B,P,4]     -> one box per part
-      boxes [B,P,M,4]   -> multiple boxes per part, accumulated as a multi-peak target
-    """
-    if boxes.ndim == 3:
-        boxes4 = boxes.unsqueeze(2)
-    elif boxes.ndim == 4:
-        boxes4 = boxes
-    else:
-        raise ValueError(f"Expected boxes shape [B,P,4] or [B,P,M,4], got {tuple(boxes.shape)}")
-
-    bsz, parts, max_boxes, _ = boxes4.shape
-    device = boxes4.device
-
+    bsz, parts, _ = boxes.shape
+    device = boxes.device
     ys = (torch.arange(h, device=device, dtype=torch.float32) + 0.5) * (float(image_size) / h)
     xs = (torch.arange(w, device=device, dtype=torch.float32) + 0.5) * (float(image_size) / w)
     yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-
     q = torch.zeros((bsz, parts, h, w), device=device, dtype=torch.float32)
     valid_bp = torch.zeros((bsz, parts), device=device, dtype=torch.bool)
-
     for b in range(bsz):
         for p in range(parts):
-            weight_acc = torch.zeros((h, w), device=device, dtype=torch.float32)
-
-            for m in range(max_boxes):
-                x1, y1, x2, y2 = boxes4[b, p, m]
-
-                if x1 < 0 or x2 <= x1 or y2 <= y1:
-                    continue
-
-                x1 = x1.clamp(0, image_size)
-                y1 = y1.clamp(0, image_size)
-                x2 = x2.clamp(0, image_size)
-                y2 = y2.clamp(0, image_size)
-
-                mask = (xx >= x1) & (xx <= x2) & (yy >= y1) & (yy <= y2)
-                if not mask.any():
-                    cx = 0.5 * (x1 + x2)
-                    cy = 0.5 * (y1 + y2)
-                    flat = int(((xx - cx).pow(2) + (yy - cy).pow(2)).argmin().item())
-                    mask = torch.zeros_like(mask)
-                    mask.view(-1)[flat] = True
-
-                if cfg.box_target_gaussian:
-                    cx = 0.5 * (x1 + x2)
-                    cy = 0.5 * (y1 + y2)
-                    sx = ((x2 - x1) * cfg.box_gaussian_sigma_scale).clamp_min(float(image_size) / w)
-                    sy = ((y2 - y1) * cfg.box_gaussian_sigma_scale).clamp_min(float(image_size) / h)
-                    weight = torch.exp(
-                        -0.5 * (
-                            ((xx - cx) / sx).pow(2)
-                            + ((yy - cy) / sy).pow(2)
-                        )
-                    ) * mask.float()
-                else:
-                    weight = mask.float()
-
-                if weight.sum() > 0:
-                    weight_acc = weight_acc + weight
-
-            if weight_acc.sum() > 0:
-                q[b, p] = weight_acc / weight_acc.sum().clamp_min(cfg.eps)
+            x1, y1, x2, y2 = boxes[b, p]
+            if x1 < 0 or x2 <= x1 or y2 <= y1:
+                continue
+            x1 = x1.clamp(0, image_size)
+            y1 = y1.clamp(0, image_size)
+            x2 = x2.clamp(0, image_size)
+            y2 = y2.clamp(0, image_size)
+            mask = (xx >= x1) & (xx <= x2) & (yy >= y1) & (yy <= y2)
+            if not mask.any():
+                cx = 0.5 * (x1 + x2)
+                cy = 0.5 * (y1 + y2)
+                flat = int(((xx - cx).pow(2) + (yy - cy).pow(2)).argmin().item())
+                mask = torch.zeros_like(mask)
+                mask.view(-1)[flat] = True
+            if cfg.box_target_gaussian:
+                cx = 0.5 * (x1 + x2)
+                cy = 0.5 * (y1 + y2)
+                sx = ((x2 - x1) * cfg.box_gaussian_sigma_scale).clamp_min(float(image_size) / w)
+                sy = ((y2 - y1) * cfg.box_gaussian_sigma_scale).clamp_min(float(image_size) / h)
+                weight = torch.exp(-0.5 * (((xx - cx) / sx).pow(2) + ((yy - cy) / sy).pow(2))) * mask.float()
+            else:
+                weight = mask.float()
+            if weight.sum() > 0:
+                q[b, p] = weight / weight.sum().clamp_min(cfg.eps)
                 valid_bp[b, p] = True
-
     return q.flatten(2), valid_bp
+
 
 # -----------------------------
 # DINO backbone
@@ -768,13 +561,6 @@ class SharedPartPrototypeDINO(nn.Module):
         elif cfg.score_mode == "scan_topk":
             kk = min(max(1, cfg.scan_topk), relu_sim.shape[2])
             proto_score_raw = relu_sim.topk(kk, dim=2).values.mean(dim=2)
-        elif cfg.score_mode == "part_max":
-            gated = part_map.unsqueeze(-1) * relu_sim
-            proto_score_raw = gated.max(dim=2).values
-        elif cfg.score_mode == "part_topk":
-            gated = part_map.unsqueeze(-1) * relu_sim
-            kk = min(max(1, cfg.scan_topk), gated.shape[2])
-            proto_score_raw = gated.topk(kk, dim=2).values.mean(dim=2)
         else:
             raise ValueError(f"Unknown score_mode={cfg.score_mode}")
 
@@ -884,56 +670,6 @@ def classifier_sparsity_loss(class_weight: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-
-
-def prototype_part_agreement_loss(
-    part_map: torch.Tensor,
-    proto_assign: torch.Tensor,
-    sim: torch.Tensor,
-    valid_bp: torch.Tensor,
-) -> torch.Tensor:
-    """Align part-query maps with prototype activation maps.
-
-    part_map:      [B,P,N], spatial distribution from part queries, excluding null.
-    proto_assign:  [B,P,N,K], within-part assignment.
-    sim:           [B,P,N,K], token-prototype cosine similarity.
-    valid_bp:      [B,P], only visible / valid GDINO-supervised parts contribute.
-
-    Directions:
-      proto_to_part: KL(stopgrad(proto_map) || part_map), updates part router.
-      part_to_proto: KL(stopgrad(part_map) || proto_map), updates prototypes.
-      symmetric:     average of both.
-    """
-    relu_sim = F.relu(sim.float())
-    proto_act = (proto_assign.float() * relu_sim).sum(dim=-1)  # [B,P,N]
-
-    proto_mass = proto_act.sum(dim=-1)                         # [B,P]
-    part_mass = part_map.float().sum(dim=-1)                   # [B,P]
-
-    proto_map = proto_act / proto_mass.unsqueeze(-1).clamp_min(cfg.eps)
-    part_dist = part_map.float() / part_mass.unsqueeze(-1).clamp_min(cfg.eps)
-
-    valid = valid_bp.bool() & (proto_mass > cfg.eps) & (part_mass > cfg.eps)
-    if not bool(valid.any()):
-        return part_map.new_tensor(0.0)
-
-    log_part = part_dist.clamp_min(cfg.eps).log()
-    log_proto = proto_map.clamp_min(cfg.eps).log()
-
-    direction = str(cfg.proto_agree_direction).lower()
-    if direction == "proto_to_part":
-        loss_bp = -(proto_map.detach() * log_part).sum(dim=-1)
-    elif direction == "part_to_proto":
-        loss_bp = -(part_dist.detach() * log_proto).sum(dim=-1)
-    elif direction == "symmetric":
-        loss_p2q = -(proto_map.detach() * log_part).sum(dim=-1)
-        loss_q2p = -(part_dist.detach() * log_proto).sum(dim=-1)
-        loss_bp = 0.5 * (loss_p2q + loss_q2p)
-    else:
-        raise ValueError(f"Unknown proto_agree_direction={cfg.proto_agree_direction}")
-
-    valid_f = valid.float()
-    return (loss_bp * valid_f).sum() / valid_f.sum().clamp_min(1.0)
 def compute_batch_debug_stats(out: Dict[str, torch.Tensor], valid_bp: torch.Tensor, y: torch.Tensor) -> Dict[str, float]:
     """Forward-pass diagnostics used to decide whether training is actually moving."""
     logits = out["logits"].float()
@@ -992,7 +728,7 @@ def compute_batch_debug_stats(out: Dict[str, torch.Tensor], valid_bp: torch.Tens
 @torch.no_grad()
 def compute_eval(model: SharedPartPrototypeDINO, loader: DataLoader, epoch: int) -> Dict[str, Any]:
     model.eval()
-    totals: Dict[str, float] = {"count": 0, "correct": 0, "ce": 0.0, "route": 0.0, "agree": 0.0}
+    totals: Dict[str, float] = {"count": 0, "correct": 0, "ce": 0.0, "route": 0.0}
     # full-image scan top activation lies inside its named part box.
     purity_num = 0.0
     purity_den = 0.0
@@ -1013,7 +749,6 @@ def compute_eval(model: SharedPartPrototypeDINO, loader: DataLoader, epoch: int)
         totals["correct"] += int((logits.argmax(1) == y).sum().item())
         totals["ce"] += float(F.cross_entropy(logits, y).item()) * bs
         totals["route"] += float(semantic_route_loss(out["part_map"], q_sem, valid_bp).item()) * bs
-        totals["agree"] += float(prototype_part_agreement_loss(out["part_map"], out["proto_assign"], out["sim"], valid_bp).item()) * bs
         active_sum += out["proto_score"].float().sum(dim=0)
 
         # part-wise top1-vs-top2 margin contribution magnitude.
@@ -1044,7 +779,6 @@ def compute_eval(model: SharedPartPrototypeDINO, loader: DataLoader, epoch: int)
         "acc": totals["correct"] / n,
         "ce": totals["ce"] / n,
         "route": totals["route"] / n,
-        "agree": totals["agree"] / n,
         "scan_part_purity": (purity_num / max(1.0, purity_den)) if cfg.compute_scan_purity else None,
         "active_proto_mean": (active_sum / n).detach().cpu().numpy().tolist(),
         "mean_abs_part_margin": (part_margin_abs / max(1, part_margin_count)).detach().cpu().numpy().tolist(),
@@ -1157,7 +891,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--image-size", type=int, default=cfg.image_size)
     p.add_argument("--parts", default=",".join(cfg.parts), help="Comma-separated parts.")
     p.add_argument("--k-per-part", type=int, default=cfg.k_per_part)
-    p.add_argument("--score-mode", choices=["resp_sum", "scan_max", "scan_topk", "part_max", "part_topk"], default=cfg.score_mode)
+    p.add_argument("--score-mode", choices=["resp_sum", "scan_max", "scan_topk"], default=cfg.score_mode)
     p.add_argument("--score-scale", type=float, default=cfg.score_scale,
                    help="Multiplies prototype evidence before the non-negative class readout. Useful for resp_sum.")
     p.add_argument("--proto-dropout", type=float, default=cfg.proto_dropout,
@@ -1179,8 +913,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ema-rho", type=float, default=cfg.ema_rho)
     p.add_argument("--ema-sem-mix", type=float, default=cfg.ema_sem_mix)
     p.add_argument("--ema-start-epoch", type=int, default=cfg.ema_start_epoch)
-    p.add_argument("--ema-stop-epoch", type=int, default=cfg.ema_stop_epoch,
-                   help="Stop EMA memory update after this epoch; 0 means never stop.")
     p.add_argument("--residual-scale", type=float, default=cfg.residual_scale)
     p.add_argument("--class-theta-init", type=float, default=cfg.class_theta_init)
     p.add_argument("--readout-mode", choices=["nonneg", "signed"], default=cfg.readout_mode,
@@ -1190,16 +922,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--route-decay-epochs", type=int, default=cfg.route_decay_epochs)
     p.add_argument("--lambda-vis", type=float, default=cfg.lambda_vis)
     p.add_argument("--lambda-proto-lb", type=float, default=cfg.lambda_proto_lb)
-    p.add_argument("--lambda-proto-agree", type=float, default=cfg.lambda_proto_agree,
-                   help="Prototype-part agreement loss weight.")
-    p.add_argument("--proto-agree-direction", choices=["proto_to_part", "part_to_proto", "symmetric"],
-                   default=cfg.proto_agree_direction,
-                   help="Direction for prototype-part agreement loss.")
     p.add_argument("--lambda-proto-div", type=float, default=cfg.lambda_proto_div)
-    p.add_argument("--lambda-cls-sparse", type=float, default=cfg.lambda_cls_sparse,
-                   help="Sparsity penalty weight on class readout weights.")
-    p.add_argument("--label-smoothing", type=float, default=cfg.label_smoothing,
-                   help="Label smoothing for the cross-entropy loss.")
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--no-resume", action="store_true")
     p.add_argument("--resume-from", choices=["last", "best", "none"], default=cfg.resume_from)
@@ -1246,7 +969,6 @@ def apply_args(args: argparse.Namespace) -> None:
     cfg.ema_rho = args.ema_rho
     cfg.ema_sem_mix = args.ema_sem_mix
     cfg.ema_start_epoch = args.ema_start_epoch
-    cfg.ema_stop_epoch = args.ema_stop_epoch
     cfg.residual_scale = args.residual_scale
     cfg.class_theta_init = args.class_theta_init
     cfg.readout_mode = args.readout_mode
@@ -1255,11 +977,7 @@ def apply_args(args: argparse.Namespace) -> None:
     cfg.route_decay_epochs = args.route_decay_epochs
     cfg.lambda_vis = args.lambda_vis
     cfg.lambda_proto_lb = args.lambda_proto_lb
-    cfg.lambda_proto_agree = args.lambda_proto_agree
-    cfg.proto_agree_direction = args.proto_agree_direction
     cfg.lambda_proto_div = args.lambda_proto_div
-    cfg.lambda_cls_sparse = args.lambda_cls_sparse
-    cfg.label_smoothing = args.label_smoothing
     cfg.amp = not args.no_amp
     cfg.resume = not args.no_resume
     cfg.resume_from = args.resume_from
@@ -1376,7 +1094,7 @@ def main() -> None:
         model.train()
         t0 = time.time()
         lam_route = route_lambda(epoch)
-        totals = {"loss":0.0, "ce":0.0, "route":0.0, "vis":0.0, "agree":0.0, "lb":0.0, "div":0.0, "sparse":0.0, "correct":0, "count":0}
+        totals = {"loss":0.0, "ce":0.0, "route":0.0, "vis":0.0, "lb":0.0, "div":0.0, "sparse":0.0, "correct":0, "count":0}
         debug_totals: Dict[str, float] = {}
         debug_count = 0
         pbar = tqdm(dl_train, desc=f"Train {epoch}/{cfg.epochs}", ncols=160)
@@ -1395,12 +1113,11 @@ def main() -> None:
                 loss_route = semantic_route_loss(out["part_map"], q_sem, valid_bp)
                 loss_vis = visible_part_loss(out["visibility"], valid_bp)
                 loss_lb = semantic_proto_load_balance_loss(out["proto_assign"], q_sem, valid_bp)
-                loss_agree = prototype_part_agreement_loss(out["part_map"], out["proto_assign"], out["sim"], valid_bp)
                 loss_div = within_part_prototype_diversity_loss(out["prototypes"])
                 loss_sparse = classifier_sparsity_loss(out["class_weight"])
                 loss = (cfg.lambda_ce * loss_ce + lam_route * loss_route + cfg.lambda_vis * loss_vis
-                        + cfg.lambda_proto_agree * loss_agree + cfg.lambda_proto_lb * loss_lb
-                        + cfg.lambda_proto_div * loss_div + cfg.lambda_cls_sparse * loss_sparse)
+                        + cfg.lambda_proto_lb * loss_lb + cfg.lambda_proto_div * loss_div
+                        + cfg.lambda_cls_sparse * loss_sparse)
 
             fwd_debug = compute_batch_debug_stats(out, valid_bp, y) if cfg.log_train_debug else {}
             scaler.scale(loss).backward()
@@ -1420,17 +1137,14 @@ def main() -> None:
                 grad_debug["grad_total_preclip"] = _finite_float(total_grad)
             scaler.step(optimizer)
             scaler.update()
-            ema_allowed = epoch >= cfg.ema_start_epoch
-            if cfg.ema_stop_epoch > 0:
-                ema_allowed = ema_allowed and epoch <= cfg.ema_stop_epoch
-            if ema_allowed and (global_step % max(1, cfg.ema_every_steps) == 0):
+            if epoch >= cfg.ema_start_epoch and (global_step % max(1, cfg.ema_every_steps) == 0):
                 model.ema_update_memory(out["Xn"].detach(), out["part_map"].detach(), out["proto_assign"].detach(), q_sem.detach(), valid_bp.detach())
             global_step += 1
 
             bs = y.shape[0]
             totals["count"] += bs
             totals["correct"] += int((out["logits"].argmax(1) == y).sum().item())
-            for key, val in [("loss", loss), ("ce", loss_ce), ("route", loss_route), ("vis", loss_vis), ("agree", loss_agree), ("lb", loss_lb), ("div", loss_div), ("sparse", loss_sparse)]:
+            for key, val in [("loss", loss), ("ce", loss_ce), ("route", loss_route), ("vis", loss_vis), ("lb", loss_lb), ("div", loss_div), ("sparse", loss_sparse)]:
                 totals[key] += float(val.detach().item()) * bs
 
             if cfg.log_train_debug:
@@ -1490,13 +1204,6 @@ def main() -> None:
             "score_mode": cfg.score_mode,
             "score_scale": cfg.score_scale,
             "proto_dropout": cfg.proto_dropout,
-            "scan_topk": cfg.scan_topk,
-            "ema_stop_epoch": cfg.ema_stop_epoch,
-            "lambda_proto_lb": cfg.lambda_proto_lb,
-            "lambda_proto_agree": cfg.lambda_proto_agree,
-            "proto_agree_direction": cfg.proto_agree_direction,
-            "label_smoothing": cfg.label_smoothing,
-            "lambda_cls_sparse": cfg.lambda_cls_sparse,
             "readout_mode": cfg.readout_mode,
             "last_proto_score_mean": float(train_debug.get("proto_score_mean", 0.0)),
             "last_logits_std": float(train_debug.get("logits_std", 0.0)),
