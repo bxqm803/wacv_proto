@@ -980,9 +980,12 @@ def set_dino_trainability(backbone: nn.Module, last_blocks: int, unfreeze_norm: 
                 for p in blk.parameters():
                     p.requires_grad = True
         if unfreeze_norm:
-            for norm in (backbone.vision_model.pre_layrnorm, backbone.vision_model.post_layernorm):
-                for p in norm.parameters():
-                    p.requires_grad = True
+            # CLIPVisionModel returns patch tokens from last_hidden_state. Its
+            # post_layernorm is applied only to pooled CLS output, which this
+            # prototype pipeline does not use; leaving it trainable causes DDP
+            # unused-parameter reduction errors. Keep only the pre-encoder norm.
+            for p in backbone.vision_model.pre_layrnorm.parameters():
+                p.requires_grad = True
     else:
         if last_blocks > 0 and hasattr(backbone, "blocks"):
             blocks = list(backbone.blocks)
