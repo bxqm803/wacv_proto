@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """End-to-end CLIP ViT-B/16 fine-tuning on CUB-200-2011.
 
-PRISM-comparable protocol defaults:
-    full CUB image -> 224x224 CLIP input -> CLIP ViT-B/16 vision encoder
+Direct-resize protocol defaults:
+    full CUB image -> direct Resize(224,224) -> CLIP ViT-B/16 vision encoder
     all vision parameters are trainable (lr=1e-5)
     768-d pooled CLS feature -> Linear(768, 200) (lr=1e-3)
     AdamW + 5-epoch 1e-6 warm-up + cosine decay, 300 epochs
@@ -15,7 +15,7 @@ Example (two GPUs):
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
   train_cub_clip_vitb16_finetune_ddp.py \
   --cub-root ./data/CUB_200_2011 \
-  --save-dir ./runs/clip_vitb16_fullimg_finetune_300e \
+  --save-dir ./runs/clip_vitb16_fullimg_resize224_finetune_300e \
   --epochs 300 --batch-size 128 --num-workers 8
 """
 
@@ -54,15 +54,12 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 @dataclass
 class Config:
     cub_root: str = "./data/CUB_200_2011"
-    save_dir: str = "./runs/clip_vitb16_fullimg_finetune_300e"
+    save_dir: str = "./runs/clip_vitb16_fullimg_resize224_finetune_300e"
     model_name: str = "openai/clip-vit-base-patch16"
     image_size: int = 224
-    eval_resize: int = 256
     feature: str = "cls"                 # cls | patch_mean | patch_max
-    use_bird_bbox: bool = False           # PRISM uses full, uncropped images.
+    use_bird_bbox: bool = False           # CUB bounding_boxes.txt; disabled for full-image runs.
     l2_normalize: bool = False
-    train_aug: str = "rrc"               # rrc | none
-    rrc_scale_min: float = 0.70
     epochs: int = 300
     warmup_epochs: int = 5
     warmup_lr: float = 1e-6
@@ -88,12 +85,9 @@ def parse_args() -> Config:
     p.add_argument("--save-dir", default=cfg.save_dir)
     p.add_argument("--model-name", default=cfg.model_name)
     p.add_argument("--image-size", type=int, default=cfg.image_size)
-    p.add_argument("--eval-resize", type=int, default=cfg.eval_resize)
     p.add_argument("--feature", choices=["cls", "patch_mean", "patch_max"], default=cfg.feature)
     p.add_argument("--use-bird-bbox", action=argparse.BooleanOptionalAction, default=cfg.use_bird_bbox)
     p.add_argument("--l2-normalize", action=argparse.BooleanOptionalAction, default=cfg.l2_normalize)
-    p.add_argument("--train-aug", choices=["rrc", "none"], default=cfg.train_aug)
-    p.add_argument("--rrc-scale-min", type=float, default=cfg.rrc_scale_min)
     p.add_argument("--epochs", type=int, default=cfg.epochs)
     p.add_argument("--warmup-epochs", type=int, default=cfg.warmup_epochs)
     p.add_argument("--warmup-lr", type=float, default=cfg.warmup_lr)
@@ -111,8 +105,6 @@ def parse_args() -> Config:
                    help="none | last | best | absolute/relative checkpoint path")
     ns = p.parse_args()
     out = Config(**vars(ns))
-    if not (0.0 < out.rrc_scale_min <= 1.0):
-        raise ValueError("--rrc-scale-min must be in (0, 1].")
     if out.epochs < 1:
         raise ValueError("--epochs must be positive.")
     if out.warmup_epochs < 0 or out.warmup_epochs >= out.epochs:
@@ -262,33 +254,18 @@ class DistributedEvalSampler(Sampler[int]):
 
 
 def build_transforms():
-    norm = transforms.Normalize(CLIP_MEAN, CLIP_STD)
-    if cfg.train_aug == "rrc":
-        train_transform = transforms.Compose([
-            transforms.RandomResizedCrop(
-                cfg.image_size,
-                scale=(cfg.rrc_scale_min, 1.0),
-                ratio=(0.75, 4.0 / 3.0),
-                interpolation=transforms.InterpolationMode.BICUBIC,
-            ),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            norm,
-        ])
-    else:
-        train_transform = transforms.Compose([
-            transforms.Resize((cfg.image_size, cfg.image_size), interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.ToTensor(),
-            norm,
-        ])
+    """Use the same direct warp for training and evaluation.
 
-    eval_transform = transforms.Compose([
-        transforms.Resize(cfg.eval_resize, interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(cfg.image_size),
+    With --use-bird-bbox, the sequence is:
+        CUB GT bounding_boxes.txt crop -> Resize(image_size, image_size).
+    Without it, the entire source image is directly resized.
+    """
+    transform = transforms.Compose([
+        transforms.Resize((cfg.image_size, cfg.image_size), interpolation=transforms.InterpolationMode.BICUBIC),
         transforms.ToTensor(),
-        norm,
+        transforms.Normalize(CLIP_MEAN, CLIP_STD),
     ])
-    return train_transform, eval_transform
+    return transform, transform
 
 
 def build_loaders() -> Tuple[DataLoader, DataLoader, DistributedSampler]:
@@ -305,7 +282,7 @@ def build_loaders() -> Tuple[DataLoader, DataLoader, DistributedSampler]:
     test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, sampler=test_sampler, drop_last=False, **common)
     rank0_print(
         f"[Data] train={len(train_ds)} test={len(test_ds)} bbox_crop={cfg.use_bird_bbox}; "
-        f"train_aug={cfg.train_aug}; eval=Resize({cfg.eval_resize})->CenterCrop({cfg.image_size})"
+        f"train/eval=direct Resize({cfg.image_size}, {cfg.image_size})"
     )
     return train_loader, test_loader, train_sampler
 
@@ -446,7 +423,7 @@ def main() -> None:
         os.makedirs(cfg.save_dir, exist_ok=True)
     barrier()
 
-    rank0_print("[Run] end-to-end CLIP ViT-B/16 fine-tuning + linear head")
+    rank0_print("[Run] end-to-end CLIP ViT-B/16 fine-tuning + linear head (direct resize)")
     rank0_print(
         f"[Run] model={cfg.model_name}; feature={cfg.feature}; l2_normalize={cfg.l2_normalize}; "
         f"global_batch={cfg.batch_size * WORLD_SIZE}"
