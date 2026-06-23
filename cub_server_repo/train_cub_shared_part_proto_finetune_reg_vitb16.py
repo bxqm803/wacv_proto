@@ -793,7 +793,10 @@ class SharedPartPrototypeModel(nn.Module):
         sem_num = torch.einsum("bpnk,bnc->pkc", sem_resp, tokens)
         sem_target = l2n(sem_num / sem_mass.unsqueeze(-1).clamp_min(cfg.eps), dim=-1, eps=cfg.eps)
 
-        valid_sem = valid_bp.unsqueeze(-1) & (sem_mass > cfg.ema_min_mass)
+        # sem_mass has already aggregated over batch and token dimensions:
+        #   [P, K].  Do not reuse valid_bp ([B, P]) here, otherwise broadcasting
+        # creates a spurious batch dimension [B, P, K] in the EMA memory update.
+        valid_sem = sem_mass > cfg.ema_min_mass
         mixed_target = torch.where(
             valid_sem.unsqueeze(-1),
             (1.0 - cfg.ema_sem_mix) * self_target + cfg.ema_sem_mix * sem_target,
