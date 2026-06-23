@@ -1,33 +1,22 @@
 #!/usr/bin/env python3
-"""Train shared part-prototype concepts on CUB with light DINOv2 or DINO ViT-B/16 finetuning.
-
-This is the "scheme A" version discussed in chat:
-
-  shared part-level prototype memory M[p,k]
-  + bounded trainable residual R[p,k]
-  + class-specific additive readout weights w[c,p,k] (non-negative or signed)
-
-The prototypes are shared across classes.  Class contrast is produced by
-class-specific readout weights over the same shared part-concept dictionary.
-The default readout is non-negative; --readout-mode signed enables positive/negative evidence:
-
-  logit_c(x) = bias_c + sum_p sum_k w[c,p,k] * e[p,k](x)
-
-The memory M is updated with the original paper-style mechanism:
-responsibility-weighted EMA + semantic injection from part boxes.  The part
-boxes are only used for route/EMA supervision; by default prototype scoring is
-not hard-masked by boxes.
-
-This version adds prototype-part agreement: part queries localize semantic
-parts, prototypes match within-part appearance modes, and an agreement loss
-keeps prototype activation maps spatially consistent with their corresponding
-part maps.
-
-Expected geometry:
-  raw CUB image -> CUB GT bird bbox crop -> resize/warp to 224x224.
-  GroundingDINO boxes should be generated on the same crop geometry, possibly
-  at another resolution; this script rescales them to 224.
 """
+Shared part-prototype finetuning on CUB-200-2011.
+
+This file supports either:
+  - DINO / DINOv2 visual backbones; or
+  - OpenAI CLIP ViT-B/16, optionally initialized from a CUB-finetuned
+    checkpoint produced by train_cub_clip_vitb16_finetune_offline_aug_all_ddp.py.
+
+For CLIP transfer, only the source checkpoint's encoder.* weights are loaded.
+Its 200-way linear head is intentionally discarded: this model learns a fresh
+part router, shared prototype dictionary, and class-specific prototype readout.
+
+Geometry:
+  raw CUB image -> official CUB bird bbox crop -> direct Resize(224, 224)
+  -> matching GDINO boxes generated on that same crop geometry.
+"""
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -35,8 +24,8 @@ import math
 import os
 import random
 import time
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -50,103 +39,95 @@ from tqdm import tqdm
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+CLIP_MEAN = (0.48145466, 0.45782750, 0.40821073)
+CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
 DEFAULT_PARTS = ("beak", "head", "wing", "body", "tail", "feet")
+DINO_V1_HUB_MODELS = {"dino_vits16", "dino_vits8", "dino_vitb16", "dino_vitb8"}
 
 
-# -----------------------------
-# Config
-# -----------------------------
 @dataclass
 class CFG:
     cub_root: str = "./data/CUB_200_2011"
     gdino_box_dir: str = "./artifacts/gdino_part_boxes_visible_resize224"
     gdino_train_file: str = "train_part_boxes_visible_resize224.pt"
     gdino_test_file: str = "test_part_boxes_visible_resize224.pt"
-    save_dir: str = "./runs/shared_part_proto_finetune"
+    save_dir: str = "./runs/shared_part_proto_finetune_clip"
 
-    # Torch hub backbone name. Examples: dinov2_vitb14 or dino_vitb16.
+    # Visual backbone.
+    backbone: str = "clip"  # clip | dino
     dino_model: str = "dinov2_vitb14"
+    clip_model: str = "openai/clip-vit-base-patch16"
+    clip_init_checkpoint: str = ""
     image_size: int = 224
-    num_classes: int = 200
-    parts: Tuple[str, ...] = ("head", "wing", "body", "tail")
-    k_per_part: int = 16
 
-    # Light finetuning.
+    num_classes: int = 200
+    parts: Tuple[str, ...] = DEFAULT_PARTS
+    k_per_part: int = 50
+
+    # Backbone adaptation.
     unfreeze_last_blocks: int = 2
     unfreeze_norm: bool = True
-    freeze_backbone_epochs: int = 3
+    freeze_backbone_epochs: int = 30
 
     # Prototype scoring.
-    # resp_sum: original responsibility-weighted evidence.
-    # scan_max: full-image prototype scan max, no part-box mask.
-    # scan_topk: average top-k full-image prototype responses.
-    # part_max: part-gated max prototype response.
-    # part_topk: average top-k part-gated prototype responses.
     score_mode: str = "resp_sum"
-    # Important for resp_sum: part_map and proto softmax make evidence small.
-    # This only calibrates logit scale; it does not change evidence attribution.
-    score_scale: float = 20.0
-    # Drop prototype evidence before class readout during training only.
-    # This regularizes the classifier without changing stored explanation scores.
-    proto_dropout: float = 0.0
-    scan_topk: int = 3
+    score_scale: float = 8.0
+    scan_topk: int = 5
     tau_part: float = 0.20
     tau_proto: float = 0.05
     null_logit_init: float = 0.0
     residual_scale: float = 0.20
+    readout_mode: str = "nonneg"  # nonneg | signed
     class_theta_init: float = 0.0
-    # nonneg: softplus(class_theta), support-only evidence.
-    # signed: raw class_theta, allowing positive and negative evidence.
-    readout_mode: str = "nonneg"
+    proto_dropout: float = 0.0
 
-    # EMA memory update.
-    ema_rho: float = 0.97
-    ema_sem_mix: float = 0.50
+    # Two-timescale prototype memory.
+    ema_rho: float = 0.99
+    ema_sem_mix: float = 0.35
     ema_min_mass: float = 1e-3
     ema_start_epoch: int = 1
-    ema_stop_epoch: int = 0  # 0 means never stop EMA
+    ema_stop_epoch: int = 0
     ema_every_steps: int = 1
 
-    # Part-box target.
+    # Semantic part-box targets.
     box_target_gaussian: bool = True
     box_gaussian_sigma_scale: float = 0.50
 
-    # Loss weights.
+    # Objective.
     label_smoothing: float = 0.0
-    lambda_ce: float = 2.0
-    lambda_route: float = 0.2
-    route_final_ratio: float = 0.1
+    lambda_ce: float = 1.0
+    lambda_route: float = 0.20
+    route_final_ratio: float = 0.10
     route_decay_epochs: int = 20
     lambda_vis: float = 0.01
-    lambda_proto_lb: float = 0.005
+    lambda_proto_lb: float = 0.01
     lambda_proto_agree: float = 0.05
-    # proto_to_part: KL(stopgrad(proto_map) || part_map), updates the part router.
-    # part_to_proto: KL(stopgrad(part_map) || proto_map), updates prototype activation.
-    # symmetric: average of both directions.
-    proto_agree_direction: str = "symmetric"
-    lambda_proto_div: float = 0.01
+    proto_agree_direction: str = "symmetric"  # proto_to_part | part_to_proto | symmetric
+    lambda_proto_div: float = 0.02
     proto_div_margin: float = 0.30
-    lambda_cls_sparse: float = 1e-5
+    lambda_cls_sparse: float = 0.0
 
-    # Optim.
-    lr_backbone: float = 1e-5
-    lr_router: float = 3e-4
-    lr_proto: float = 3e-4
-    lr_classifier: float = 1e-2
+    # Optimization.
+    lr_backbone: float = 1e-6
+    lr_router: float = 1e-4
+    lr_proto: float = 1e-4
+    lr_classifier: float = 2e-3
     weight_decay: float = 1e-4
     grad_clip: float = 5.0
 
-    # Train.
-    epochs: int = 100
+    # Training.
+    epochs: int = 200
     batch_size: int = 32
-    max_train_batches: int = 0  # 0 means full epoch
-    num_workers: int = 4
-    seed: int = 0
+    max_train_batches: int = 0  # 0 = full epoch
+    num_workers: int = 8
+    seed: int = 42
     amp: bool = True
+
+    # Resume.
     resume: bool = True
-    resume_from: str = "last"  # last | best | none
+    resume_from: str = "last"  # last | best | none | path
     reset_optimizer_on_resume: bool = False
-    resume_class_theta_min: Optional[float] = None
 
     # Semantic bootstrap.
     bootstrap_memory: bool = True
@@ -154,23 +135,21 @@ class CFG:
     bootstrap_max_tokens_per_part: int = 20000
     bootstrap_kmeans_iters: int = 20
 
-    # Eval / logging.
+    # Logging/evaluation.
     eval_every: int = 1
     save_every: int = 1
-    compute_scan_purity: bool = True
     log_train_debug: bool = True
     debug_every: int = 50
-
     eps: float = 1e-9
 
 
 cfg = CFG()
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Utilities
-# -----------------------------
+# -----------------------------------------------------------------------------
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -183,14 +162,54 @@ def l2n(x: torch.Tensor, dim: int = -1, eps: float = 1e-9) -> torch.Tensor:
     return x / x.norm(dim=dim, keepdim=True).clamp_min(eps)
 
 
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def safe_torch_load(path: str, map_location: str | torch.device = "cpu") -> Any:
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def input_normalization() -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
+    if cfg.backbone == "clip":
+        return CLIP_MEAN, CLIP_STD
+    return IMAGENET_MEAN, IMAGENET_STD
+
+
+def route_lambda(epoch: int) -> float:
+    if cfg.route_decay_epochs <= 0:
+        return cfg.lambda_route
+    progress = min(max((epoch - 1) / float(cfg.route_decay_epochs), 0.0), 1.0)
+    factor = 1.0 + progress * (cfg.route_final_ratio - 1.0)
+    return cfg.lambda_route * factor
+
+
+def finite_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return default
+            value = value.detach().float().mean().item()
+        value = float(value)
+        return value if math.isfinite(value) else default
+    except Exception:
+        return default
+
+
+# -----------------------------------------------------------------------------
+# CUB metadata and matched GDINO boxes
+# -----------------------------------------------------------------------------
 def read_kv_text(path: str) -> Dict[int, str]:
     out: Dict[int, str] = {}
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            line = line.strip()
-            if line:
-                k, v = line.split(maxsplit=1)
-                out[int(k)] = v
+            row = line.strip()
+            if row:
+                key, value = row.split(maxsplit=1)
+                out[int(key)] = value
     return out
 
 
@@ -198,10 +217,10 @@ def read_kv_int(path: str) -> Dict[int, int]:
     out: Dict[int, int] = {}
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            line = line.strip()
-            if line:
-                k, v = line.split()
-                out[int(k)] = int(v)
+            row = line.strip()
+            if row:
+                key, value = row.split()
+                out[int(key)] = int(value)
     return out
 
 
@@ -209,9 +228,9 @@ def read_bboxes(path: str) -> Dict[int, Tuple[float, float, float, float]]:
     out: Dict[int, Tuple[float, float, float, float]] = {}
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            vals = line.strip().split()
-            if vals:
-                out[int(vals[0])] = tuple(float(x) for x in vals[1:5])
+            values = line.strip().split()
+            if values:
+                out[int(values[0])] = tuple(float(v) for v in values[1:5])  # type: ignore[assignment]
     return out
 
 
@@ -225,120 +244,33 @@ def crop_bbox(image: Image.Image, bbox: Tuple[float, float, float, float]) -> Im
     return image.crop((x1, y1, x2, y2))
 
 
-def route_lambda(epoch: int) -> float:
-    if cfg.route_decay_epochs <= 0:
-        return cfg.lambda_route
-    t = min(max(epoch - 1, 0) / float(cfg.route_decay_epochs), 1.0)
-    ratio = 1.0 + t * (cfg.route_final_ratio - 1.0)
-    return cfg.lambda_route * ratio
-
-
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def _finite_float(x: Any, default: float = 0.0) -> float:
-    """Convert scalar/tensor to a finite Python float for logging."""
-    try:
-        if isinstance(x, torch.Tensor):
-            x = x.detach().float()
-            if x.numel() == 0:
-                return default
-            val = float(x.mean().item())
-        else:
-            val = float(x)
-    except Exception:
-        return default
-    return val if math.isfinite(val) else default
-
-
-def add_weighted_stats(dst: Dict[str, float], stats: Dict[str, float], weight: int) -> None:
-    for k, v in stats.items():
-        val = _finite_float(v)
-        dst[k] = dst.get(k, 0.0) + val * int(weight)
-
-
-def grad_norm_of_tensors(params: Iterable[torch.Tensor]) -> float:
-    total = 0.0
-    for p in params:
-        if p is None or p.grad is None:
-            continue
-        g = p.grad.detach().float()
-        total += float(g.pow(2).sum().item())
-    return math.sqrt(total) if total > 0 else 0.0
-
-
-# -----------------------------
-# CUB metadata and GDINO boxes
-# -----------------------------
 def build_cub_samples(cub_root: str, split: str) -> List[Dict[str, Any]]:
-    paths = read_kv_text(os.path.join(cub_root, "images.txt"))
+    if split not in {"train", "test"}:
+        raise ValueError(f"Unknown split: {split}")
+    image_paths = read_kv_text(os.path.join(cub_root, "images.txt"))
     labels = read_kv_int(os.path.join(cub_root, "image_class_labels.txt"))
     split_map = read_kv_int(os.path.join(cub_root, "train_test_split.txt"))
     bboxes = read_bboxes(os.path.join(cub_root, "bounding_boxes.txt"))
+
     want_train = split == "train"
     samples: List[Dict[str, Any]] = []
-    for image_id in sorted(paths):
+    for image_id in sorted(image_paths):
         if (split_map[image_id] == 1) != want_train:
             continue
-        samples.append({
-            "image_id": image_id,
-            "relpath": paths[image_id],
-            "label": labels[image_id] - 1,
-            "bbox": bboxes[image_id],
-        })
+        samples.append(
+            {
+                "image_id": image_id,
+                "relpath": image_paths[image_id],
+                "label": labels[image_id] - 1,
+                "bbox": bboxes[image_id],
+            }
+        )
     return samples
 
 
-def _parse_one_sample_part_boxes(elem: Any, parts_in_file: List[str]) -> np.ndarray:
-    out = np.full((len(parts_in_file), 4), -1.0, dtype=np.float32)
-    if elem is None:
-        return out
-    if isinstance(elem, dict):
-        for j, name in enumerate(parts_in_file):
-            val = elem.get(name)
-            if val is None:
-                continue
-            arr = np.asarray(val, dtype=np.float32)
-            if arr.ndim == 1 and arr.size == 4:
-                out[j] = arr
-            elif arr.ndim == 2 and arr.shape[-1] == 4 and arr.shape[0] > 0:
-                valid = arr[(arr[:, 0] >= 0) & (arr[:, 2] > arr[:, 0]) & (arr[:, 3] > arr[:, 1])]
-                if len(valid):
-                    out[j] = np.array([valid[:,0].min(), valid[:,1].min(), valid[:,2].max(), valid[:,3].max()], dtype=np.float32)
-        return out
-    arr = np.asarray(elem, dtype=np.float32)
-    if arr.ndim == 2 and arr.shape[-1] == 4:
-        m = min(len(parts_in_file), arr.shape[0])
-        out[:m] = arr[:m]
-    return out
-
-
-NEW_GDINO_PART_ORDER = ("beak", "head", "tail", "body", "feet", "wing")
-
-
-def _infer_gdino_parts(gd: Dict[str, Any]) -> List[str]:
-    """Infer part order stored in a GDINO cache."""
-    if "parts" in gd:
-        return [str(x).lower() for x in gd["parts"]]
-
-    if isinstance(gd.get("prompts", None), dict):
-        # New visible-resize224 cache produced by build_gdino_part_boxes_visible_resize224.py.
-        # Python preserves dict insertion order, so this recovers the builder order:
-        # beak, head, tail, body, feet, wing.
-        return [str(x).lower() for x in gd["prompts"].keys()]
-
-    if "selected_boxes_xyxy" in gd:
-        return list(NEW_GDINO_PART_ORDER)
-
-    return list(DEFAULT_PARTS)
-
-
-def _valid_xyxy_np(raw: Any) -> np.ndarray:
-    """Return valid xyxy boxes as [M,4] float32; invalid / empty -> [0,4]."""
+def valid_xyxy(raw: Any) -> np.ndarray:
     if raw is None:
         return np.zeros((0, 4), dtype=np.float32)
-
     try:
         if isinstance(raw, torch.Tensor):
             arr = raw.detach().cpu().float().numpy()
@@ -349,7 +281,6 @@ def _valid_xyxy_np(raw: Any) -> np.ndarray:
 
     if arr.size == 0:
         return np.zeros((0, 4), dtype=np.float32)
-
     if arr.ndim == 1 and arr.size == 4:
         arr = arr.reshape(1, 4)
     elif arr.ndim >= 2 and arr.shape[-1] == 4:
@@ -357,422 +288,386 @@ def _valid_xyxy_np(raw: Any) -> np.ndarray:
     else:
         return np.zeros((0, 4), dtype=np.float32)
 
-    valid = (
-        (arr[:, 0] >= 0)
-        & (arr[:, 2] > arr[:, 0])
-        & (arr[:, 3] > arr[:, 1])
-    )
-    return arr[valid].astype(np.float32)
+    keep = (arr[:, 0] >= 0) & (arr[:, 2] > arr[:, 0]) & (arr[:, 3] > arr[:, 1])
+    return arr[keep].astype(np.float32, copy=False)
 
 
-def _max_boxes_in_selected(selected: Any) -> int:
-    max_m = 1
-    if not isinstance(selected, (list, tuple)):
-        return max_m
-
-    for image_parts in selected:
-        if not isinstance(image_parts, (list, tuple)):
-            continue
-        for part_boxes in image_parts:
-            arr = _valid_xyxy_np(part_boxes)
-            max_m = max(max_m, int(arr.shape[0]))
-
-    return max_m
+def infer_parts_in_file(gd: Dict[str, Any]) -> List[str]:
+    if "parts" in gd:
+        return [str(v).lower() for v in gd["parts"]]
+    if isinstance(gd.get("prompts"), dict):
+        return [str(v).lower() for v in gd["prompts"].keys()]
+    if "selected_boxes_xyxy" in gd:
+        # Order emitted by the visible-resize224 cache builder.
+        return ["beak", "head", "tail", "body", "feet", "wing"]
+    return list(DEFAULT_PARTS)
 
 
-def _load_gdino_part_boxes_tensor(gd: Dict[str, Any], parts_in_file: List[str]) -> torch.Tensor:
-    """Load GDINO cache into [N_file, P_file, M, 4].
-
-    Supports:
-      new format: selected_boxes_xyxy = [N][P][M][4], visible_parts = [N][P]
-      old format: part_boxes_xyxy_pix = tensor/list with [N,P,4] or [N,P,M,4]
-    """
-    p_need = len(parts_in_file)
-
+def fetch_cache_part_boxes(gd: Dict[str, Any], image_idx: int, part_idx: int) -> np.ndarray:
+    """Return [M,4] for one cached image and one source-part index."""
     if "selected_boxes_xyxy" in gd:
         selected = gd["selected_boxes_xyxy"]
-        visible = gd.get("visible_parts", None)
-        if not isinstance(selected, (list, tuple)):
-            raise TypeError(f"selected_boxes_xyxy must be list/tuple, got {type(selected)}")
+        visible = gd.get("visible_parts")
+        try:
+            if visible is not None and not bool(visible[image_idx][part_idx]):
+                return np.zeros((0, 4), dtype=np.float32)
+            return valid_xyxy(selected[image_idx][part_idx])
+        except Exception:
+            return np.zeros((0, 4), dtype=np.float32)
 
-        max_m = _max_boxes_in_selected(selected)
-        out = torch.full((len(selected), p_need, max_m, 4), -1.0, dtype=torch.float32)
+    raw = gd.get("part_boxes_xyxy_pix")
+    if raw is None:
+        raise KeyError("GDINO cache needs selected_boxes_xyxy or part_boxes_xyxy_pix.")
 
-        for i, image_parts in enumerate(selected):
-            if not isinstance(image_parts, (list, tuple)):
+    if isinstance(raw, torch.Tensor):
+        if raw.ndim == 3:
+            return valid_xyxy(raw[image_idx, part_idx])
+        if raw.ndim == 4:
+            return valid_xyxy(raw[image_idx, part_idx])
+        raise ValueError(f"Unsupported GDINO tensor shape: {tuple(raw.shape)}")
+
+    try:
+        item = raw[image_idx]
+        if isinstance(item, dict):
+            names = infer_parts_in_file(gd)
+            return valid_xyxy(item.get(names[part_idx]))
+        return valid_xyxy(item[part_idx])
+    except Exception:
+        return np.zeros((0, 4), dtype=np.float32)
+
+
+def load_aligned_part_boxes(
+    samples: Sequence[Dict[str, Any]],
+    gdino_path: str,
+    model_image_size: int,
+) -> torch.Tensor:
+    gd = safe_torch_load(gdino_path, map_location="cpu")
+    if not isinstance(gd, dict) or "relpaths" not in gd:
+        raise KeyError(f"Bad GDINO cache: {gdino_path} must contain relpaths.")
+
+    relpaths = [str(v) for v in gd["relpaths"]]
+    index_by_relpath = {path: idx for idx, path in enumerate(relpaths)}
+    parts_in_file = infer_parts_in_file(gd)
+    source_size = int(gd.get("image_size", gd.get("img_size", model_image_size)))
+    scale = float(model_image_size) / max(1.0, float(source_size))
+
+    def source_indices(target_part: str) -> List[int]:
+        name = target_part.lower()
+        if name == "wing":
+            return [i for i, x in enumerate(parts_in_file) if "wing" in x]
+        if name == "beak":
+            return [i for i, x in enumerate(parts_in_file) if "beak" in x or "bill" in x]
+        if name == "feet":
+            return [i for i, x in enumerate(parts_in_file) if any(t in x for t in ("feet", "foot", "leg"))]
+        return [i for i, x in enumerate(parts_in_file) if x == name]
+
+    part_source_indices = [source_indices(name) for name in cfg.parts]
+    temp: List[List[np.ndarray]] = []
+    max_boxes = 1
+    missing_images = 0
+
+    for sample in samples:
+        cache_idx = index_by_relpath.get(str(sample["relpath"]))
+        image_parts: List[np.ndarray] = []
+        if cache_idx is None:
+            missing_images += 1
+            image_parts = [np.zeros((0, 4), dtype=np.float32) for _ in cfg.parts]
+        else:
+            for source_indices_for_part in part_source_indices:
+                chunks = [fetch_cache_part_boxes(gd, cache_idx, idx) for idx in source_indices_for_part]
+                boxes = np.concatenate(chunks, axis=0) if chunks else np.zeros((0, 4), dtype=np.float32)
+                image_parts.append(boxes)
+                max_boxes = max(max_boxes, int(boxes.shape[0]))
+        temp.append(image_parts)
+
+    out = torch.full((len(samples), len(cfg.parts), max_boxes, 4), -1.0, dtype=torch.float32)
+    for i, image_parts in enumerate(temp):
+        for p, boxes in enumerate(image_parts):
+            if boxes.size == 0:
                 continue
-
-            for p in range(min(p_need, len(image_parts))):
-                is_visible = True
-                if visible is not None:
-                    try:
-                        is_visible = bool(visible[i][p])
-                    except Exception:
-                        is_visible = True
-                if not is_visible:
-                    continue
-
-                arr = _valid_xyxy_np(image_parts[p])
-                if arr.shape[0] == 0:
-                    continue
-
-                m = min(max_m, arr.shape[0])
-                out[i, p, :m] = torch.from_numpy(arr[:m])
-
-        return out
-
-    if "part_boxes_xyxy_pix" not in gd:
-        raise KeyError(
-            "Bad GDINO cache: expected either 'selected_boxes_xyxy' "
-            "or 'part_boxes_xyxy_pix'."
-        )
-
-    pb = gd["part_boxes_xyxy_pix"]
-
-    if isinstance(pb, torch.Tensor):
-        pb = pb.float()
-        if pb.ndim == 3 and pb.shape[-1] == 4:
-            out = torch.full((pb.shape[0], p_need, 1, 4), -1.0, dtype=torch.float32)
-            m = min(p_need, pb.shape[1])
-            out[:, :m, 0, :] = pb[:, :m, :]
-            return out
-
-        if pb.ndim == 4 and pb.shape[-1] == 4:
-            b = pb.reshape(pb.shape[0], pb.shape[1], -1, 4)
-            out = torch.full((b.shape[0], p_need, b.shape[2], 4), -1.0, dtype=torch.float32)
-            m = min(p_need, b.shape[1])
-            out[:, :m, :, :] = b[:, :m, :, :]
-            return out
-
-        raise ValueError(f"Unexpected part box tensor shape: {tuple(pb.shape)}")
-
-    if isinstance(pb, (list, tuple)):
-        parsed: List[List[np.ndarray]] = []
-        max_m = 1
-
-        for elem in pb:
-            cur: List[np.ndarray] = []
-            for p in range(p_need):
-                arr = np.zeros((0, 4), dtype=np.float32)
-
-                if isinstance(elem, dict):
-                    name = parts_in_file[p]
-                    arr = _valid_xyxy_np(elem.get(name, None))
-                elif isinstance(elem, (list, tuple)) and p < len(elem):
-                    arr = _valid_xyxy_np(elem[p])
-                else:
-                    raw = _valid_xyxy_np(elem)
-                    if raw.shape[0] > p:
-                        arr = raw[p:p+1]
-
-                max_m = max(max_m, int(arr.shape[0]))
-                cur.append(arr)
-
-            parsed.append(cur)
-
-        out = torch.full((len(parsed), p_need, max_m, 4), -1.0, dtype=torch.float32)
-        for i, cur in enumerate(parsed):
-            for p, arr in enumerate(cur):
-                if arr.shape[0] == 0:
-                    continue
-                m = min(max_m, arr.shape[0])
-                out[i, p, :m] = torch.from_numpy(arr[:m])
-        return out
-
-    raise TypeError(f"Unsupported GDINO box container: {type(pb)}")
-
-
-def load_aligned_part_boxes(samples: List[Dict[str, Any]], gdino_path: str, model_image_size: int) -> torch.Tensor:
-    gd = torch.load(gdino_path, map_location="cpu")
-
-    if "relpaths" not in gd:
-        raise KeyError(f"Bad GDINO cache: missing relpaths in {gdino_path}")
-
-    is_new_visible_format = "selected_boxes_xyxy" in gd
-    parts_in_file = _infer_gdino_parts(gd)
-    src_size = int(gd.get("image_size", gd.get("img_size", model_image_size)))
-    scale = float(model_image_size) / float(src_size)
-
-    boxes_pf = _load_gdino_part_boxes_tensor(gd, parts_in_file)
-    # [N_file, P_file, M_file, 4]
-
-    relpaths = [str(x) for x in gd["relpaths"]]
-    gd_index = {rp: i for i, rp in enumerate(relpaths)}
-
-    def match_indices(target: str) -> List[int]:
-        t = target.lower()
-        if t == "wing":
-            return [i for i, n in enumerate(parts_in_file) if "wing" in n]
-        if t == "beak":
-            return [i for i, n in enumerate(parts_in_file) if "beak" in n or "bill" in n]
-        if t == "feet":
-            return [i for i, n in enumerate(parts_in_file) if "feet" in n or "foot" in n or "leg" in n]
-        return [i for i, n in enumerate(parts_in_file) if n == t]
-
-    matched: List[List[int]] = []
-    max_match = 1
-    for part_name in cfg.parts:
-        idxs = match_indices(part_name)
-        matched.append(idxs)
-        max_match = max(max_match, len(idxs))
-
-    max_boxes_per_part = max(1, boxes_pf.shape[2] * max_match)
-    aligned_src = torch.full(
-        (boxes_pf.shape[0], len(cfg.parts), max_boxes_per_part, 4),
-        -1.0,
-        dtype=torch.float32,
-    )
-
-    for p, idxs in enumerate(matched):
-        if not idxs:
-            continue
-        bx = boxes_pf[:, idxs, :, :].reshape(boxes_pf.shape[0], -1, 4)
-        m = min(max_boxes_per_part, bx.shape[1])
-        aligned_src[:, p, :m, :] = bx[:, :m, :]
-
-    out = torch.full(
-        (len(samples), len(cfg.parts), max_boxes_per_part, 4),
-        -1.0,
-        dtype=torch.float32,
-    )
-
-    missing = 0
-    for i, s in enumerate(samples):
-        j = gd_index.get(str(s["relpath"]))
-        if j is None:
-            missing += 1
-            continue
-        out[i] = aligned_src[j] * scale
+            m = min(max_boxes, boxes.shape[0])
+            out[i, p, :m] = torch.from_numpy(boxes[:m] * scale)
 
     valid = (out[..., 0] >= 0) & (out[..., 2] > out[..., 0]) & (out[..., 3] > out[..., 1])
-    valid_part_ratio = valid.any(dim=-1).float().mean().item()
-
     print(
-        f"[GDINO] {os.path.basename(gdino_path)} "
-        f"format={'selected_boxes_xyxy' if is_new_visible_format else 'part_boxes_xyxy_pix'} "
-        f"src_size={src_size} model_size={model_image_size} scale={scale:.4f} "
-        f"parts_in_file={parts_in_file} "
-        f"aligned={len(samples)-missing}/{len(samples)} missing_images={missing} "
-        f"valid_part_ratio={valid_part_ratio:.4f} "
-        f"max_boxes_per_part={max_boxes_per_part}"
+        f"[GDINO] {os.path.basename(gdino_path)} src={source_size} -> model={model_image_size}; "
+        f"parts_in_file={parts_in_file}; requested={list(cfg.parts)}; "
+        f"matched={len(samples) - missing_images}/{len(samples)}; "
+        f"valid_part_ratio={valid.any(dim=-1).float().mean().item():.4f}; "
+        f"max_boxes_per_part={max_boxes}"
     )
     return out
 
 
-
 class CUBImageWithPartBoxes(Dataset):
     def __init__(self, split: str, gdino_path: str):
-        if split not in {"train", "test"}:
-            raise ValueError(split)
-        self.split = split
         self.samples = build_cub_samples(cfg.cub_root, split)
         self.boxes = load_aligned_part_boxes(self.samples, gdino_path, cfg.image_size)
-        self.transform = transforms.Compose([
-            transforms.Resize((cfg.image_size, cfg.image_size), interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.ToTensor(),
-            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-        ])
+        mean, std = input_normalization()
+        self.transform = transforms.Compose(
+            [
+                transforms.Resize(
+                    (cfg.image_size, cfg.image_size),
+                    interpolation=transforms.InterpolationMode.BICUBIC,
+                ),
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+            ]
+        )
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int):
-        s = self.samples[idx]
-        path = os.path.join(cfg.cub_root, "images", s["relpath"])
-        with Image.open(path) as img:
-            img = img.convert("RGB")
-            img = crop_bbox(img, s["bbox"])
-            x = self.transform(img)
-        return x, self.boxes[idx], int(s["label"]), str(s["relpath"])
+        sample = self.samples[idx]
+        path = os.path.join(cfg.cub_root, "images", str(sample["relpath"]))
+        with Image.open(path) as image:
+            image = image.convert("RGB")
+        image = crop_bbox(image, sample["bbox"])
+        return self.transform(image), self.boxes[idx], int(sample["label"]), str(sample["relpath"])
 
 
-def make_loader(ds: Dataset, train: bool) -> DataLoader:
+def make_loader(dataset: Dataset, train: bool) -> DataLoader:
     return DataLoader(
-        ds,
+        dataset,
         batch_size=cfg.batch_size,
         shuffle=train,
         num_workers=cfg.num_workers,
-        pin_memory=(DEVICE == "cuda"),
-        drop_last=train,
+        pin_memory=DEVICE.type == "cuda",
+        persistent_workers=cfg.num_workers > 0,
+        drop_last=False,
     )
 
 
-# -----------------------------
-# Part boxes -> token distributions
-# -----------------------------
-def boxes_to_soft_q(boxes: torch.Tensor, h: int, w: int, image_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Convert part boxes to token-level soft targets.
-
-    Supports:
-      boxes [B,P,4]     -> one box per part
-      boxes [B,P,M,4]   -> multiple boxes per part, accumulated as a multi-peak target
+# -----------------------------------------------------------------------------
+# Part boxes to soft patch targets
+# -----------------------------------------------------------------------------
+def boxes_to_soft_targets(
+    boxes: torch.Tensor,
+    grid_h: int,
+    grid_w: int,
+    image_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    boxes: [B,P,M,4], xyxy in the resized image coordinate system.
+    Returns:
+      q_sem    [B,P,N], normalized within each valid part
+      valid_bp [B,P]
     """
     if boxes.ndim == 3:
-        boxes4 = boxes.unsqueeze(2)
-    elif boxes.ndim == 4:
-        boxes4 = boxes
-    else:
-        raise ValueError(f"Expected boxes shape [B,P,4] or [B,P,M,4], got {tuple(boxes.shape)}")
+        boxes = boxes.unsqueeze(2)
+    if boxes.ndim != 4:
+        raise ValueError(f"Expected [B,P,M,4] boxes, got {tuple(boxes.shape)}")
 
-    bsz, parts, max_boxes, _ = boxes4.shape
-    device = boxes4.device
-
-    ys = (torch.arange(h, device=device, dtype=torch.float32) + 0.5) * (float(image_size) / h)
-    xs = (torch.arange(w, device=device, dtype=torch.float32) + 0.5) * (float(image_size) / w)
+    batch, parts, max_boxes, _ = boxes.shape
+    device = boxes.device
+    ys = (torch.arange(grid_h, device=device, dtype=torch.float32) + 0.5) * (image_size / grid_h)
+    xs = (torch.arange(grid_w, device=device, dtype=torch.float32) + 0.5) * (image_size / grid_w)
     yy, xx = torch.meshgrid(ys, xs, indexing="ij")
 
-    q = torch.zeros((bsz, parts, h, w), device=device, dtype=torch.float32)
-    valid_bp = torch.zeros((bsz, parts), device=device, dtype=torch.bool)
+    targets = torch.zeros((batch, parts, grid_h, grid_w), device=device, dtype=torch.float32)
+    valid = torch.zeros((batch, parts), device=device, dtype=torch.bool)
 
-    for b in range(bsz):
+    for b in range(batch):
         for p in range(parts):
-            weight_acc = torch.zeros((h, w), device=device, dtype=torch.float32)
-
+            combined = torch.zeros((grid_h, grid_w), device=device, dtype=torch.float32)
             for m in range(max_boxes):
-                x1, y1, x2, y2 = boxes4[b, p, m]
-
-                if x1 < 0 or x2 <= x1 or y2 <= y1:
+                x1, y1, x2, y2 = boxes[b, p, m]
+                if x1 < 0 or y1 < 0 or x2 <= x1 or y2 <= y1:
                     continue
-
                 x1 = x1.clamp(0, image_size)
                 y1 = y1.clamp(0, image_size)
                 x2 = x2.clamp(0, image_size)
                 y2 = y2.clamp(0, image_size)
 
                 mask = (xx >= x1) & (xx <= x2) & (yy >= y1) & (yy <= y2)
-                if not mask.any():
+                if not bool(mask.any()):
                     cx = 0.5 * (x1 + x2)
                     cy = 0.5 * (y1 + y2)
-                    flat = int(((xx - cx).pow(2) + (yy - cy).pow(2)).argmin().item())
+                    nearest = ((xx - cx).square() + (yy - cy).square()).flatten().argmin()
                     mask = torch.zeros_like(mask)
-                    mask.view(-1)[flat] = True
+                    mask.flatten()[nearest] = True
 
                 if cfg.box_target_gaussian:
                     cx = 0.5 * (x1 + x2)
                     cy = 0.5 * (y1 + y2)
-                    sx = ((x2 - x1) * cfg.box_gaussian_sigma_scale).clamp_min(float(image_size) / w)
-                    sy = ((y2 - y1) * cfg.box_gaussian_sigma_scale).clamp_min(float(image_size) / h)
+                    sx = ((x2 - x1) * cfg.box_gaussian_sigma_scale).clamp_min(image_size / grid_w)
+                    sy = ((y2 - y1) * cfg.box_gaussian_sigma_scale).clamp_min(image_size / grid_h)
                     weight = torch.exp(
-                        -0.5 * (
-                            ((xx - cx) / sx).pow(2)
-                            + ((yy - cy) / sy).pow(2)
-                        )
+                        -0.5 * (((xx - cx) / sx).square() + ((yy - cy) / sy).square())
                     ) * mask.float()
                 else:
                     weight = mask.float()
+                combined = combined + weight
 
-                if weight.sum() > 0:
-                    weight_acc = weight_acc + weight
+            if combined.sum() > 0:
+                targets[b, p] = combined / combined.sum().clamp_min(cfg.eps)
+                valid[b, p] = True
 
-            if weight_acc.sum() > 0:
-                q[b, p] = weight_acc / weight_acc.sum().clamp_min(cfg.eps)
-                valid_bp[b, p] = True
-
-    return q.flatten(2), valid_bp
-
-# -----------------------------
-# Visual backbone
-# -----------------------------
-DINO_V1_HUB_MODELS = {
-    "dino_vits16",
-    "dino_vits8",
-    "dino_vitb16",
-    "dino_vitb8",
-}
+    return targets.flatten(2), valid
 
 
-def load_visual_backbone(model_name: str) -> nn.Module:
-    """Load DINOv2 models or the original DINO ViT-B/16 family.
+# -----------------------------------------------------------------------------
+# Visual backbones
+# -----------------------------------------------------------------------------
+def load_clip_encoder_checkpoint(backbone: nn.Module, checkpoint_path: str) -> None:
+    """Restore encoder.* only from the CUB CLIP finetuning checkpoint."""
+    if not checkpoint_path:
+        print("[CLIP init] no CUB checkpoint supplied; using the OpenAI CLIP initialization.")
+        return
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"CLIP init checkpoint not found: {checkpoint_path}")
 
-    DINOv2 uses the facebookresearch/dinov2 hub.
-    Original DINO models such as dino_vitb16 use facebookresearch/dino:main.
-    """
-    if model_name in DINO_V1_HUB_MODELS:
-        model = torch.hub.load("facebookresearch/dino:main", model_name)
-        # Original DINO forward_features returns CLS only; patch tokens come from
-        # get_intermediate_layers.  Mark it to avoid a redundant full forward.
-        model._proto_is_dino_v1 = True
+    payload = safe_torch_load(checkpoint_path, map_location="cpu")
+    raw_state = payload.get("model", payload) if isinstance(payload, dict) else payload
+    if not isinstance(raw_state, dict):
+        raise TypeError(f"Expected a state dict in {checkpoint_path}, got {type(raw_state)}")
+
+    encoder_state: Dict[str, torch.Tensor] = {}
+    for raw_key, tensor in raw_state.items():
+        key = str(raw_key)
+        if key.startswith("module."):
+            key = key[len("module."):]
+        if key.startswith("encoder."):
+            encoder_state[key[len("encoder."):]] = tensor
+        elif key.startswith("vision_model."):
+            # Also accepts a bare CLIPVisionModel state dict.
+            encoder_state[key] = tensor
+
+    if not encoder_state:
+        preview = list(raw_state.keys())[:12]
+        raise KeyError(
+            "No encoder.* state was found. Expected a checkpoint from the CLIP "
+            f"finetuning script. First keys: {preview}"
+        )
+
+    incompatible = backbone.load_state_dict(encoder_state, strict=False)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "The supplied CLIP checkpoint is incompatible with the requested "
+            f"backbone. missing={incompatible.missing_keys[:12]}, "
+            f"unexpected={incompatible.unexpected_keys[:12]}"
+        )
+
+    epoch = payload.get("epoch", "?") if isinstance(payload, dict) else "?"
+    best_acc = payload.get("best_acc", "?") if isinstance(payload, dict) else "?"
+    print(
+        f"[CLIP init] loaded {len(encoder_state)} visual-tower tensors from {checkpoint_path}; "
+        f"source_epoch={epoch}, source_best_acc={best_acc}; ignored source head.*"
+    )
+
+
+def load_visual_backbone() -> nn.Module:
+    if cfg.backbone == "clip":
+        try:
+            from transformers import CLIPVisionModel
+        except ImportError as exc:
+            raise ImportError("CLIP support requires: pip install transformers") from exc
+
+        model = CLIPVisionModel.from_pretrained(cfg.clip_model)
+        model._proto_backbone_kind = "clip"
+        load_clip_encoder_checkpoint(model, cfg.clip_init_checkpoint)
         return model
 
-    model = torch.hub.load("facebookresearch/dinov2", model_name)
-    model._proto_is_dino_v1 = False
+    if cfg.backbone != "dino":
+        raise ValueError(f"Unknown backbone: {cfg.backbone}")
+
+    if cfg.dino_model in DINO_V1_HUB_MODELS:
+        model = torch.hub.load("facebookresearch/dino:main", cfg.dino_model)
+        model._proto_backbone_kind = "dino_v1"
+        return model
+
+    model = torch.hub.load("facebookresearch/dinov2", cfg.dino_model)
+    model._proto_backbone_kind = "dinov2"
     return model
 
 
 def extract_patch_tokens(backbone: nn.Module, images: torch.Tensor) -> Tuple[torch.Tensor, int, int]:
-    """Return local patch tokens [B,N,C] for DINOv2 or original DINO.
+    kind = str(getattr(backbone, "_proto_backbone_kind", ""))
 
-    DINOv2 forward_features exposes x_norm_patchtokens. Original DINO's
-    forward_features returns only CLS, therefore we read the final normalized
-    intermediate layer and remove its leading CLS token.
-    """
-    if bool(getattr(backbone, "_proto_is_dino_v1", False)):
-        if not hasattr(backbone, "get_intermediate_layers"):
-            raise RuntimeError("Original DINO backbone lacks get_intermediate_layers.")
+    if kind == "clip":
+        out = backbone(pixel_values=images, return_dict=True)
+        # The transferred classifier was trained on post-LayerNorm CLS features.
+        # Apply the same learned LayerNorm token-wise to local patch features.
+        x = backbone.vision_model.post_layernorm(out.last_hidden_state[:, 1:, :])
+
+    elif kind == "dino_v1":
         layers = backbone.get_intermediate_layers(images, n=1)
-        if not isinstance(layers, (list, tuple)) or not layers:
-            raise RuntimeError("Could not extract tokens from original DINO.")
         x = layers[-1]
         if isinstance(x, (list, tuple)):
             x = x[0]
-        if not isinstance(x, torch.Tensor) or x.ndim != 3:
-            raise RuntimeError("Unexpected original-DINO token output.")
-
+        if x.ndim != 3:
+            raise RuntimeError(f"Unexpected original-DINO output: {tuple(x.shape)}")
         patch_size = getattr(getattr(backbone, "patch_embed", None), "patch_size", 16)
         if isinstance(patch_size, (tuple, list)):
             patch_size = patch_size[0]
-        expected_n = (images.shape[-2] // int(patch_size)) * (images.shape[-1] // int(patch_size))
-        if x.shape[1] == expected_n + 1:
+        expected = (images.shape[-2] // int(patch_size)) * (images.shape[-1] // int(patch_size))
+        if x.shape[1] == expected + 1:
             x = x[:, 1:]
+
     else:
-        feats = backbone.forward_features(images)
-        if isinstance(feats, dict):
-            x = feats.get("x_norm_patchtokens", None)
+        features = backbone.forward_features(images)
+        if isinstance(features, dict):
+            x = features.get("x_norm_patchtokens")
             if x is None:
-                x = feats.get("x_prenorm", None)
+                x = features.get("x_prenorm")
                 if x is not None and x.ndim == 3:
                     x = x[:, 1:]
-        elif isinstance(feats, torch.Tensor) and feats.ndim == 3:
-            x = feats
+        elif isinstance(features, torch.Tensor) and features.ndim == 3:
+            x = features
         else:
             x = None
-
         if x is None or x.ndim != 3:
-            raise RuntimeError("Could not extract patch tokens from DINOv2 output.")
+            raise RuntimeError("Could not extract DINOv2 patch tokens.")
 
-    n = x.shape[1]
-    g = int(round(math.sqrt(n)))
-    if g * g != n:
-        # Safety fallback for a [CLS | patches] output not removed above.
-        g_after_cls = int(round(math.sqrt(max(0, n - 1))))
-        if g_after_cls * g_after_cls == n - 1:
+    n_tokens = x.shape[1]
+    side = int(round(math.sqrt(n_tokens)))
+    if side * side != n_tokens and n_tokens > 1:
+        maybe_side = int(round(math.sqrt(n_tokens - 1)))
+        if maybe_side * maybe_side == n_tokens - 1:
             x = x[:, 1:]
-            n = x.shape[1]
-            g = int(round(math.sqrt(n)))
+            side = maybe_side
 
-    if x.ndim != 3 or g * g != x.shape[1]:
-        raise RuntimeError(f"Patch tokens are not a square grid: shape={tuple(x.shape)}")
-    return x.float(), g, g
-
-
-def set_dino_trainability(backbone: nn.Module, last_blocks: int, unfreeze_norm: bool) -> int:
-    for p in backbone.parameters():
-        p.requires_grad = False
-    if last_blocks > 0 and hasattr(backbone, "blocks"):
-        blocks = list(backbone.blocks)
-        for blk in blocks[-int(last_blocks):]:
-            for p in blk.parameters():
-                p.requires_grad = True
-    if unfreeze_norm and hasattr(backbone, "norm"):
-        for p in backbone.norm.parameters():
-            p.requires_grad = True
-    return sum(p.numel() for p in backbone.parameters() if p.requires_grad)
+    if side * side != x.shape[1]:
+        raise RuntimeError(f"Patch-token count must form a square grid, got {tuple(x.shape)}")
+    return x.float(), side, side
 
 
-# -----------------------------
-# Model
-# -----------------------------
-class SharedPartPrototypeDINO(nn.Module):
+def set_backbone_trainability(backbone: nn.Module, last_blocks: int, unfreeze_norm: bool) -> int:
+    for parameter in backbone.parameters():
+        parameter.requires_grad_(False)
+
+    kind = str(getattr(backbone, "_proto_backbone_kind", ""))
+    if kind == "clip":
+        blocks = list(backbone.vision_model.encoder.layers)
+        if last_blocks > 0:
+            for block in blocks[-int(last_blocks):]:
+                for parameter in block.parameters():
+                    parameter.requires_grad_(True)
+        if unfreeze_norm:
+            for norm_name in ("pre_layrnorm", "post_layernorm"):
+                norm = getattr(backbone.vision_model, norm_name, None)
+                if norm is not None:
+                    for parameter in norm.parameters():
+                        parameter.requires_grad_(True)
+
+    elif kind in {"dino_v1", "dinov2"}:
+        blocks = list(getattr(backbone, "blocks", []))
+        if last_blocks > 0:
+            for block in blocks[-int(last_blocks):]:
+                for parameter in block.parameters():
+                    parameter.requires_grad_(True)
+        if unfreeze_norm and hasattr(backbone, "norm"):
+            for parameter in backbone.norm.parameters():
+                parameter.requires_grad_(True)
+
+    return sum(parameter.numel() for parameter in backbone.parameters() if parameter.requires_grad)
+
+
+# -----------------------------------------------------------------------------
+# Part-gated prototype model
+# -----------------------------------------------------------------------------
+class SharedPartPrototypeModel(nn.Module):
     def __init__(self, backbone: nn.Module, dim: int, parts: int, k: int, classes: int):
         super().__init__()
         self.backbone = backbone
@@ -780,19 +675,23 @@ class SharedPartPrototypeDINO(nn.Module):
         self.parts = int(parts)
         self.k = int(k)
         self.classes = int(classes)
+
         self.part_queries = nn.Parameter(torch.randn(parts, dim) * 0.02)
         self.null_logits = nn.Parameter(torch.full((parts,), float(cfg.null_logit_init)))
-        memory = l2n(torch.randn(parts, k, dim), dim=-1)
-        self.register_buffer("memory", memory)
+
+        self.register_buffer("memory", l2n(torch.randn(parts, k, dim), dim=-1))
         self.proto_residual = nn.Parameter(torch.zeros(parts, k, dim))
-        self.class_theta = nn.Parameter(torch.full((classes, parts, k), float(cfg.class_theta_init)))
+
+        self.class_theta = nn.Parameter(
+            torch.full((classes, parts, k), float(cfg.class_theta_init))
+        )
         self.class_bias = nn.Parameter(torch.zeros(classes))
 
     def extract_tokens(self, images: torch.Tensor) -> Tuple[torch.Tensor, int, int]:
         return extract_patch_tokens(self.backbone, images)
 
     def effective_prototypes(self) -> torch.Tensor:
-        delta = float(cfg.residual_scale) * torch.tanh(self.proto_residual.float())
+        delta = cfg.residual_scale * torch.tanh(self.proto_residual.float())
         return l2n(self.memory.float() + delta, dim=-1, eps=cfg.eps)
 
     def class_weights(self) -> torch.Tensor:
@@ -800,70 +699,72 @@ class SharedPartPrototypeDINO(nn.Module):
             return F.softplus(self.class_theta.float())
         if cfg.readout_mode == "signed":
             return self.class_theta.float()
-        raise ValueError(f"Unknown readout_mode={cfg.readout_mode}")
+        raise ValueError(f"Unknown readout mode: {cfg.readout_mode}")
 
     def forward(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
-        x, h, w = self.extract_tokens(images)
-        xn = l2n(x, dim=-1, eps=cfg.eps)
-        # One distribution over local tokens plus a null slot per named part.
-        part_logits = torch.einsum("bnc,pc->bpn", xn, l2n(self.part_queries.float(), dim=-1, eps=cfg.eps))
-        part_logits = part_logits / max(cfg.tau_part, 1e-6)
-        null = self.null_logits.float().view(1, self.parts, 1).expand(xn.shape[0], -1, -1)
-        part_all = torch.cat([part_logits, null], dim=-1)
-        part_prob = F.softmax(part_all, dim=-1)
-        part_map = part_prob[..., :-1]
-        visibility = 1.0 - part_prob[..., -1]
+        tokens, h, w = self.extract_tokens(images)
+        normalized_tokens = l2n(tokens, dim=-1, eps=cfg.eps)
+
+        part_logits = torch.einsum(
+            "bnc,pc->bpn",
+            normalized_tokens,
+            l2n(self.part_queries.float(), dim=-1, eps=cfg.eps),
+        ) / max(cfg.tau_part, 1e-6)
+
+        null = self.null_logits.float().view(1, self.parts, 1).expand(
+            normalized_tokens.shape[0], -1, -1
+        )
+        part_prob_all = F.softmax(torch.cat([part_logits, null], dim=-1), dim=-1)
+        part_map = part_prob_all[..., :-1]
+        visibility = 1.0 - part_prob_all[..., -1]
 
         prototypes = self.effective_prototypes()
-        sim = torch.einsum("bnc,pkc->bpnk", xn, prototypes)
-        proto_assign = F.softmax(sim / max(cfg.tau_proto, 1e-6), dim=-1)
+        similarity = torch.einsum("bnc,pkc->bpnk", normalized_tokens, prototypes)
+        proto_assign = F.softmax(similarity / max(cfg.tau_proto, 1e-6), dim=-1)
         responsibility = part_map.unsqueeze(-1) * proto_assign
-        relu_sim = F.relu(sim)
+        relu_similarity = F.relu(similarity)
 
         if cfg.score_mode == "resp_sum":
-            proto_score_raw = (responsibility * relu_sim).sum(dim=2)  # B,P,K
+            proto_score_raw = (responsibility * relu_similarity).sum(dim=2)
         elif cfg.score_mode == "scan_max":
-            proto_score_raw = relu_sim.max(dim=2).values
+            proto_score_raw = relu_similarity.max(dim=2).values
         elif cfg.score_mode == "scan_topk":
-            kk = min(max(1, cfg.scan_topk), relu_sim.shape[2])
-            proto_score_raw = relu_sim.topk(kk, dim=2).values.mean(dim=2)
+            k_top = min(max(1, cfg.scan_topk), relu_similarity.shape[2])
+            proto_score_raw = relu_similarity.topk(k_top, dim=2).values.mean(dim=2)
         elif cfg.score_mode == "part_max":
-            gated = part_map.unsqueeze(-1) * relu_sim
-            proto_score_raw = gated.max(dim=2).values
+            proto_score_raw = (part_map.unsqueeze(-1) * relu_similarity).max(dim=2).values
         elif cfg.score_mode == "part_topk":
-            gated = part_map.unsqueeze(-1) * relu_sim
-            kk = min(max(1, cfg.scan_topk), gated.shape[2])
-            proto_score_raw = gated.topk(kk, dim=2).values.mean(dim=2)
+            gated = part_map.unsqueeze(-1) * relu_similarity
+            k_top = min(max(1, cfg.scan_topk), gated.shape[2])
+            proto_score_raw = gated.topk(k_top, dim=2).values.mean(dim=2)
         else:
-            raise ValueError(f"Unknown score_mode={cfg.score_mode}")
+            raise ValueError(f"Unknown score mode: {cfg.score_mode}")
 
-        proto_score = proto_score_raw * float(cfg.score_scale)
-
-        utilization = responsibility.sum(dim=2)
-        class_weight = self.class_weights()
-        if self.training and float(cfg.proto_dropout) > 0.0:
-            proto_score_for_cls = F.dropout(proto_score, p=float(cfg.proto_dropout), training=True)
+        proto_score = proto_score_raw * cfg.score_scale
+        if self.training and cfg.proto_dropout > 0:
+            proto_score_for_cls = F.dropout(proto_score, p=cfg.proto_dropout, training=True)
         else:
             proto_score_for_cls = proto_score
-        contributions = proto_score_for_cls[:, None] * class_weight[None]  # B,C,P,K
-        part_evidence = contributions.sum(dim=-1)                         # B,C,P
+
+        class_weight = self.class_weights()
+        contributions = proto_score_for_cls[:, None] * class_weight[None]
+        part_evidence = contributions.sum(dim=-1)
         logits = self.class_bias.float().view(1, -1) + part_evidence.sum(dim=-1)
 
         return {
             "logits": logits,
-            "Xn": xn,
+            "tokens": normalized_tokens,
             "grid_h": torch.tensor(h, device=images.device),
             "grid_w": torch.tensor(w, device=images.device),
             "part_map": part_map,
             "visibility": visibility,
             "prototypes": prototypes,
-            "sim": sim,
+            "similarity": similarity,
             "proto_assign": proto_assign,
             "responsibility": responsibility,
-            "utilization": utilization,
+            "utilization": responsibility.sum(dim=2),
             "proto_score_raw": proto_score_raw,
             "proto_score": proto_score,
-            "proto_score_for_cls": proto_score_for_cls,
             "class_weight": class_weight,
             "contributions": contributions,
             "part_evidence": part_evidence,
@@ -872,466 +773,382 @@ class SharedPartPrototypeDINO(nn.Module):
     @torch.no_grad()
     def ema_update_memory(
         self,
-        xn: torch.Tensor,
+        tokens: torch.Tensor,
         part_map: torch.Tensor,
         proto_assign: torch.Tensor,
         q_sem: torch.Tensor,
         valid_bp: torch.Tensor,
     ) -> None:
-        # Original-style self-routed target.
+        """
+        Slow memory update:
+          self-routed target + semantic target inside visible GDINO part regions.
+        """
         self_resp = part_map.unsqueeze(-1) * proto_assign
-        self_den = self_resp.sum(dim=(0, 2))
-        self_num = torch.einsum("bpnk,bnc->pkc", self_resp, xn.float())
-        self_target = l2n(self_num / self_den.unsqueeze(-1).clamp_min(cfg.eps), dim=-1, eps=cfg.eps)
+        self_mass = self_resp.sum(dim=(0, 2))
+        self_num = torch.einsum("bpnk,bnc->pkc", self_resp, tokens)
+        self_target = l2n(self_num / self_mass.unsqueeze(-1).clamp_min(cfg.eps), dim=-1, eps=cfg.eps)
 
-        # Semantic target: part box first, then proto_assign partitions that region.
         sem_resp = q_sem.unsqueeze(-1) * proto_assign
-        sem_den = sem_resp.sum(dim=(0, 2))
-        sem_num = torch.einsum("bpnk,bnc->pkc", sem_resp, xn.float())
-        sem_target = l2n(sem_num / sem_den.unsqueeze(-1).clamp_min(cfg.eps), dim=-1, eps=cfg.eps)
+        sem_mass = sem_resp.sum(dim=(0, 2))
+        sem_num = torch.einsum("bpnk,bnc->pkc", sem_resp, tokens)
+        sem_target = l2n(sem_num / sem_mass.unsqueeze(-1).clamp_min(cfg.eps), dim=-1, eps=cfg.eps)
 
-        valid_part = valid_bp.any(dim=0).float().view(self.parts, 1, 1)
-        sem_valid_pk = (sem_den > cfg.ema_min_mass).float().unsqueeze(-1)
-        alpha = float(cfg.ema_sem_mix) * valid_part * sem_valid_pk
-        target = l2n((1.0 - alpha) * self_target + alpha * sem_target, dim=-1, eps=cfg.eps)
-
-        update_mask = ((self_den > cfg.ema_min_mass) | (sem_den > cfg.ema_min_mass)).unsqueeze(-1)
-        candidate = l2n(float(cfg.ema_rho) * self.memory.float() + (1.0 - float(cfg.ema_rho)) * target,
-                        dim=-1, eps=cfg.eps)
-        self.memory.copy_(torch.where(update_mask, candidate, self.memory.float()))
-
-
-# -----------------------------
-# Losses and metrics
-# -----------------------------
-def semantic_route_loss(part_map: torch.Tensor, q_sem: torch.Tensor, valid_bp: torch.Tensor) -> torch.Tensor:
-    pred = part_map / part_map.sum(dim=-1, keepdim=True).clamp_min(cfg.eps)
-    ce = -(q_sem * pred.clamp_min(cfg.eps).log()).sum(dim=-1)
-    valid = valid_bp.float()
-    return (ce * valid).sum() / valid.sum().clamp_min(1.0)
+        valid_sem = valid_bp.unsqueeze(-1) & (sem_mass > cfg.ema_min_mass)
+        mixed_target = torch.where(
+            valid_sem.unsqueeze(-1),
+            (1.0 - cfg.ema_sem_mix) * self_target + cfg.ema_sem_mix * sem_target,
+            self_target,
+        )
+        valid_update = self_mass > cfg.ema_min_mass
+        updated = l2n(
+            cfg.ema_rho * self.memory.float() + (1.0 - cfg.ema_rho) * mixed_target,
+            dim=-1,
+            eps=cfg.eps,
+        )
+        self.memory.copy_(torch.where(valid_update.unsqueeze(-1), updated, self.memory.float()))
 
 
-def visible_part_loss(visibility: torch.Tensor, valid_bp: torch.Tensor) -> torch.Tensor:
-    valid = valid_bp.float()
-    loss = -visibility.clamp_min(cfg.eps).log()
-    return (loss * valid).sum() / valid.sum().clamp_min(1.0)
+# -----------------------------------------------------------------------------
+# Losses and initialization
+# -----------------------------------------------------------------------------
+def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask_f = mask.float()
+    return (values * mask_f).sum() / mask_f.sum().clamp_min(1.0)
 
 
-def semantic_proto_load_balance_loss(proto_assign: torch.Tensor, q_sem: torch.Tensor, valid_bp: torch.Tensor) -> torch.Tensor:
-    usage = (q_sem.unsqueeze(-1) * proto_assign).sum(dim=(0, 2))
-    part_valid = valid_bp.any(dim=0)
-    if not part_valid.any():
-        return usage.new_tensor(0.0)
-    prob = usage / usage.sum(dim=-1, keepdim=True).clamp_min(cfg.eps)
-    entropy = -(prob.clamp_min(cfg.eps) * prob.clamp_min(cfg.eps).log()).sum(dim=-1)
-    return (math.log(max(2, usage.shape[-1])) - entropy[part_valid]).mean()
-
-
-def within_part_prototype_diversity_loss(prototypes: torch.Tensor) -> torch.Tensor:
-    q = l2n(prototypes.float(), dim=-1, eps=cfg.eps)
-    sim = torch.matmul(q, q.transpose(1, 2))
-    k = q.shape[1]
-    eye = torch.eye(k, device=q.device, dtype=torch.bool).unsqueeze(0)
-    penalty = F.relu(sim - float(cfg.proto_div_margin)).pow(2).masked_fill(eye, 0.0)
-    return penalty.sum() / max(1, q.shape[0] * k * (k - 1))
-
-
-def classifier_sparsity_loss(class_weight: torch.Tensor) -> torch.Tensor:
-    if cfg.readout_mode == "signed":
-        return class_weight.abs().mean()
-    return class_weight.mean()
-
-
-@torch.no_grad()
-
-
-def prototype_part_agreement_loss(
-    part_map: torch.Tensor,
-    proto_assign: torch.Tensor,
-    sim: torch.Tensor,
+def compute_losses(
+    output: Dict[str, torch.Tensor],
+    labels: torch.Tensor,
+    q_sem: torch.Tensor,
     valid_bp: torch.Tensor,
-) -> torch.Tensor:
-    """Align part-query maps with prototype activation maps.
+    epoch: int,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    ce = F.cross_entropy(output["logits"], labels, label_smoothing=cfg.label_smoothing)
 
-    part_map:      [B,P,N], spatial distribution from part queries, excluding null.
-    proto_assign:  [B,P,N,K], within-part assignment.
-    sim:           [B,P,N,K], token-prototype cosine similarity.
-    valid_bp:      [B,P], only visible / valid GDINO-supervised parts contribute.
+    part_map = output["part_map"].float()
+    route_ce = -(q_sem * torch.log(part_map.clamp_min(cfg.eps))).sum(dim=-1)
+    route = masked_mean(route_ce, valid_bp)
 
-    Directions:
-      proto_to_part: KL(stopgrad(proto_map) || part_map), updates part router.
-      part_to_proto: KL(stopgrad(part_map) || proto_map), updates prototypes.
-      symmetric:     average of both.
-    """
-    relu_sim = F.relu(sim.float())
-    proto_act = (proto_assign.float() * relu_sim).sum(dim=-1)  # [B,P,N]
+    visibility_loss = masked_mean(
+        -torch.log(output["visibility"].float().clamp_min(cfg.eps)),
+        valid_bp,
+    )
 
-    proto_mass = proto_act.sum(dim=-1)                         # [B,P]
-    part_mass = part_map.float().sum(dim=-1)                   # [B,P]
-
-    proto_map = proto_act / proto_mass.unsqueeze(-1).clamp_min(cfg.eps)
-    part_dist = part_map.float() / part_mass.unsqueeze(-1).clamp_min(cfg.eps)
-
-    valid = valid_bp.bool() & (proto_mass > cfg.eps) & (part_mass > cfg.eps)
-    if not bool(valid.any()):
-        return part_map.new_tensor(0.0)
-
-    log_part = part_dist.clamp_min(cfg.eps).log()
-    log_proto = proto_map.clamp_min(cfg.eps).log()
-
-    direction = str(cfg.proto_agree_direction).lower()
-    if direction == "proto_to_part":
-        loss_bp = -(proto_map.detach() * log_part).sum(dim=-1)
-    elif direction == "part_to_proto":
-        loss_bp = -(part_dist.detach() * log_proto).sum(dim=-1)
-    elif direction == "symmetric":
-        loss_p2q = -(proto_map.detach() * log_part).sum(dim=-1)
-        loss_q2p = -(part_dist.detach() * log_proto).sum(dim=-1)
-        loss_bp = 0.5 * (loss_p2q + loss_q2p)
-    else:
-        raise ValueError(f"Unknown proto_agree_direction={cfg.proto_agree_direction}")
-
-    valid_f = valid.float()
-    return (loss_bp * valid_f).sum() / valid_f.sum().clamp_min(1.0)
-def compute_batch_debug_stats(out: Dict[str, torch.Tensor], valid_bp: torch.Tensor, y: torch.Tensor) -> Dict[str, float]:
-    """Forward-pass diagnostics used to decide whether training is actually moving."""
-    logits = out["logits"].float()
-    proto_score = out["proto_score"].float()
-    proto_score_raw = out.get("proto_score_raw", proto_score).float()
-    class_weight = out["class_weight"].float()
-    part_map = out["part_map"].float()
-    visibility = out["visibility"].float()
-    utilization = out["utilization"].float()
-    sim = out["sim"].float()
-
-    if logits.shape[1] >= 2:
-        top2_vals = logits.topk(2, dim=1).values
-        logit_margin = top2_vals[:, 0] - top2_vals[:, 1]
-    else:
-        logit_margin = logits.new_zeros((logits.shape[0],))
-
+    # Every prototype's spatial responsibility map should resemble its parent
+    # part map after both are normalized over the local token grid.
     part_dist = part_map / part_map.sum(dim=-1, keepdim=True).clamp_min(cfg.eps)
-    part_entropy = -(part_dist.clamp_min(cfg.eps) * part_dist.clamp_min(cfg.eps).log()).sum(dim=-1)
+    proto_maps = output["responsibility"].permute(0, 1, 3, 2).float()
+    proto_dist = proto_maps / proto_maps.sum(dim=-1, keepdim=True).clamp_min(cfg.eps)
+    part_expand = part_dist.unsqueeze(2).expand_as(proto_dist)
 
-    pred = logits.argmax(dim=1)
-    true_logit = logits.gather(1, y.view(-1, 1)).squeeze(1)
-    pred_logit = logits.gather(1, pred.view(-1, 1)).squeeze(1)
+    kl_part_to_proto = (part_expand * (
+        torch.log(part_expand.clamp_min(cfg.eps)) - torch.log(proto_dist.clamp_min(cfg.eps))
+    )).sum(dim=-1)
+    kl_proto_to_part = (proto_dist * (
+        torch.log(proto_dist.clamp_min(cfg.eps)) - torch.log(part_expand.clamp_min(cfg.eps))
+    )).sum(dim=-1)
 
-    return {
-        "valid_bp_ratio": _finite_float(valid_bp.float().mean()),
-        "proto_score_raw_mean": _finite_float(proto_score_raw.mean()),
-        "proto_score_raw_max": _finite_float(proto_score_raw.max()),
-        "proto_score_mean": _finite_float(proto_score.mean()),
-        "proto_score_std": _finite_float(proto_score.std(unbiased=False)),
-        "proto_score_max": _finite_float(proto_score.max()),
-        "relu_sim_mean": _finite_float(F.relu(sim).mean()),
-        "relu_sim_max": _finite_float(F.relu(sim).max()),
-        "utilization_mean": _finite_float(utilization.mean()),
-        "utilization_max": _finite_float(utilization.max()),
-        "visibility_mean": _finite_float(visibility.mean()),
-        "visibility_min": _finite_float(visibility.min()),
-        "part_entropy_mean": _finite_float(part_entropy.mean()),
-        "logits_mean": _finite_float(logits.mean()),
-        "logits_std": _finite_float(logits.std(unbiased=False)),
-        "logits_min": _finite_float(logits.min()),
-        "logits_max": _finite_float(logits.max()),
-        "logit_margin_mean": _finite_float(logit_margin.mean()),
-        "true_minus_pred_logit_mean": _finite_float((true_logit - pred_logit).mean()),
-        "class_weight_mean": _finite_float(class_weight.mean()),
-        "class_weight_abs_mean": _finite_float(class_weight.abs().mean()),
-        "class_weight_std": _finite_float(class_weight.std(unbiased=False)),
-        "class_weight_min": _finite_float(class_weight.min()),
-        "class_weight_max": _finite_float(class_weight.max()),
-        "class_weight_pos_ratio": _finite_float((class_weight > 1e-3).float().mean()),
-        "class_weight_neg_ratio": _finite_float((class_weight < -1e-3).float().mean()),
-        "class_weight_active_ratio": _finite_float((class_weight.abs() > 1e-3).float().mean()),
-    }
-
-
-@torch.no_grad()
-def compute_eval(model: SharedPartPrototypeDINO, loader: DataLoader, epoch: int) -> Dict[str, Any]:
-    model.eval()
-    totals: Dict[str, float] = {"count": 0, "correct": 0, "ce": 0.0, "route": 0.0, "agree": 0.0}
-    # full-image scan top activation lies inside its named part box.
-    purity_num = 0.0
-    purity_den = 0.0
-    active_sum = torch.zeros((model.parts, model.k), device=DEVICE)
-    part_margin_abs = torch.zeros((model.parts,), device=DEVICE)
-    part_margin_count = 0
-
-    for images, boxes, y, _ in tqdm(loader, desc=f"Eval {epoch}", ncols=120):
-        images = images.to(DEVICE, non_blocking=True).float()
-        boxes = boxes.to(DEVICE, non_blocking=True).float()
-        y = y.to(DEVICE, non_blocking=True)
-        out = model(images)
-        h, w = int(out["grid_h"].item()), int(out["grid_w"].item())
-        q_sem, valid_bp = boxes_to_soft_q(boxes, h, w, cfg.image_size)
-        logits = out["logits"]
-        bs = y.shape[0]
-        totals["count"] += bs
-        totals["correct"] += int((logits.argmax(1) == y).sum().item())
-        totals["ce"] += float(F.cross_entropy(logits, y).item()) * bs
-        totals["route"] += float(semantic_route_loss(out["part_map"], q_sem, valid_bp).item()) * bs
-        totals["agree"] += float(prototype_part_agreement_loss(out["part_map"], out["proto_assign"], out["sim"], valid_bp).item()) * bs
-        active_sum += out["proto_score"].float().sum(dim=0)
-
-        # part-wise top1-vs-top2 margin contribution magnitude.
-        top2 = logits.topk(2, dim=1).indices
-        pred, conf = top2[:, 0], top2[:, 1]
-        pe = out["part_evidence"]
-        delta = pe[torch.arange(bs, device=DEVICE), pred] - pe[torch.arange(bs, device=DEVICE), conf]
-        part_margin_abs += delta.abs().sum(dim=0)
-        part_margin_count += bs
-
-        if cfg.compute_scan_purity:
-            sim = out["sim"].float()  # B,P,N,K, unmasked scan
-            topn = sim.argmax(dim=2)  # B,P,K
-            # q_sem > 0 means inside the original hard box support because q outside box is zero.
-            q_flat = q_sem > 0
-            for p in range(model.parts):
-                valid_b = valid_bp[:, p]
-                if not valid_b.any():
-                    continue
-                ids = topn[valid_b, p, :]  # Bv,K
-                q_p = q_flat[valid_b, p, :]  # Bv,N
-                hit = q_p.gather(1, ids.reshape(ids.shape[0], -1)).float()
-                purity_num += float(hit.sum().item())
-                purity_den += float(hit.numel())
-
-    n = max(1, int(totals["count"]))
-    metrics: Dict[str, Any] = {
-        "acc": totals["correct"] / n,
-        "ce": totals["ce"] / n,
-        "route": totals["route"] / n,
-        "agree": totals["agree"] / n,
-        "scan_part_purity": (purity_num / max(1.0, purity_den)) if cfg.compute_scan_purity else None,
-        "active_proto_mean": (active_sum / n).detach().cpu().numpy().tolist(),
-        "mean_abs_part_margin": (part_margin_abs / max(1, part_margin_count)).detach().cpu().numpy().tolist(),
-    }
-    return metrics
-
-
-# -----------------------------
-# Bootstrap memory
-# -----------------------------
-@torch.no_grad()
-def torch_kmeans_cosine(x: torch.Tensor, k: int, iters: int) -> torch.Tensor:
-    x = l2n(x.float(), dim=-1, eps=cfg.eps)
-    n = x.shape[0]
-    if n == 0:
-        return l2n(torch.randn(k, x.shape[-1], device=x.device), dim=-1)
-    if n < k:
-        reps = int(math.ceil(k / n))
-        init = x.repeat(reps, 1)[:k].clone()
+    if cfg.proto_agree_direction == "part_to_proto":
+        proto_agree_each = kl_part_to_proto
+    elif cfg.proto_agree_direction == "proto_to_part":
+        proto_agree_each = kl_proto_to_part
+    elif cfg.proto_agree_direction == "symmetric":
+        proto_agree_each = 0.5 * (kl_part_to_proto + kl_proto_to_part)
     else:
-        idx = torch.randperm(n, device=x.device)[:k]
-        init = x[idx].clone()
-    cent = l2n(init, dim=-1, eps=cfg.eps)
-    for _ in range(max(1, iters)):
-        assign = (x @ cent.t()).argmax(dim=1)
-        new = []
-        for j in range(k):
-            m = assign == j
-            if m.any():
-                new.append(x[m].mean(dim=0))
-            else:
-                new.append(x[torch.randint(0, n, (1,), device=x.device)[0]])
-        cent = l2n(torch.stack(new, dim=0), dim=-1, eps=cfg.eps)
-    return cent
+        raise ValueError(f"Unknown proto_agree_direction: {cfg.proto_agree_direction}")
+    proto_agree = masked_mean(proto_agree_each.mean(dim=-1), valid_bp)
+
+    util = output["utilization"].float().mean(dim=0)
+    util_dist = util / util.sum(dim=-1, keepdim=True).clamp_min(cfg.eps)
+    proto_lb = -(torch.log(util_dist.clamp_min(cfg.eps)).mean(dim=-1) + math.log(util_dist.shape[-1])).mean()
+
+    prototypes = output["prototypes"].float()
+    cosine = torch.einsum("pkc,plc->pkl", prototypes, prototypes)
+    eye = torch.eye(cosine.shape[-1], device=cosine.device, dtype=torch.bool).unsqueeze(0)
+    proto_div = F.relu(cosine - cfg.proto_div_margin).masked_select(~eye).mean()
+
+    cls_sparse = output["class_weight"].abs().mean()
+
+    total = (
+        cfg.lambda_ce * ce
+        + route_lambda(epoch) * route
+        + cfg.lambda_vis * visibility_loss
+        + cfg.lambda_proto_lb * proto_lb
+        + cfg.lambda_proto_agree * proto_agree
+        + cfg.lambda_proto_div * proto_div
+        + cfg.lambda_cls_sparse * cls_sparse
+    )
+
+    stats = {
+        "loss": finite_float(total),
+        "ce": finite_float(ce),
+        "route": finite_float(route),
+        "vis": finite_float(visibility_loss),
+        "proto_lb": finite_float(proto_lb),
+        "proto_agree": finite_float(proto_agree),
+        "proto_div": finite_float(proto_div),
+        "cls_sparse": finite_float(cls_sparse),
+        "visibility": finite_float(output["visibility"]),
+    }
+    return total, stats
 
 
 @torch.no_grad()
-def bootstrap_memory_from_part_boxes(model: SharedPartPrototypeDINO, loader: DataLoader) -> None:
-    if cfg.bootstrap_batches <= 0:
+def run_kmeans(vectors: torch.Tensor, k: int, iterations: int) -> torch.Tensor:
+    vectors = l2n(vectors.float(), dim=-1, eps=cfg.eps)
+    if vectors.shape[0] < k:
+        idx = torch.randint(vectors.shape[0], (k,), device=vectors.device)
+        return vectors[idx]
+
+    perm = torch.randperm(vectors.shape[0], device=vectors.device)[:k]
+    centers = vectors[perm].clone()
+
+    for _ in range(max(1, iterations)):
+        assignment = (vectors @ centers.t()).argmax(dim=1)
+        next_centers = []
+        for j in range(k):
+            group = vectors[assignment == j]
+            next_centers.append(group.mean(dim=0) if group.numel() else centers[j])
+        centers = l2n(torch.stack(next_centers), dim=-1, eps=cfg.eps)
+    return centers
+
+
+@torch.no_grad()
+def bootstrap_memory(model: SharedPartPrototypeModel, loader: DataLoader) -> None:
+    if not cfg.bootstrap_memory:
+        print("[Bootstrap] skipped.")
         return
+
+    print(f"[Bootstrap] collecting semantic part tokens for up to {cfg.bootstrap_batches} batches.")
+    collected: List[List[torch.Tensor]] = [[] for _ in range(model.parts)]
     model.eval()
-    buckets: List[List[torch.Tensor]] = [[] for _ in range(model.parts)]
-    max_per_part = int(cfg.bootstrap_max_tokens_per_part)
-    seen_batches = 0
-    for images, boxes, _, _ in tqdm(loader, desc="Bootstrap memory", ncols=120):
-        images = images.to(DEVICE, non_blocking=True).float()
-        boxes = boxes.to(DEVICE, non_blocking=True).float()
-        x, h, w = model.extract_tokens(images)
-        xn = l2n(x.float(), dim=-1, eps=cfg.eps)
-        q_sem, valid_bp = boxes_to_soft_q(boxes, h, w, cfg.image_size)
-        hard = q_sem > 0
-        for p in range(model.parts):
-            mask = hard[:, p, :]
-            if mask.any() and sum(t.shape[0] for t in buckets[p]) < max_per_part:
-                vals = xn[mask]
-                if vals.shape[0] > 2048:
-                    vals = vals[torch.randperm(vals.shape[0], device=vals.device)[:2048]]
-                buckets[p].append(vals.detach())
-        seen_batches += 1
-        if seen_batches >= cfg.bootstrap_batches:
+    model.backbone.eval()
+
+    for step, (images, boxes, _, _) in enumerate(tqdm(loader, desc="Bootstrap", dynamic_ncols=True)):
+        if cfg.bootstrap_batches > 0 and step >= cfg.bootstrap_batches:
             break
-    new_mem = model.memory.detach().clone().to(DEVICE)
-    for p in range(model.parts):
-        if buckets[p]:
-            x = torch.cat(buckets[p], dim=0)
-            if x.shape[0] > max_per_part:
-                x = x[torch.randperm(x.shape[0], device=x.device)[:max_per_part]]
-            new_mem[p] = torch_kmeans_cosine(x, model.k, cfg.bootstrap_kmeans_iters)
-            print(f"[Bootstrap] {cfg.parts[p]} tokens={x.shape[0]}")
-        else:
-            print(f"[Bootstrap] warning: no tokens for {cfg.parts[p]}")
-    model.memory.copy_(l2n(new_mem, dim=-1, eps=cfg.eps).cpu() if model.memory.device.type == "cpu" else l2n(new_mem, dim=-1, eps=cfg.eps))
+        images = images.to(DEVICE, non_blocking=True)
+        boxes = boxes.to(DEVICE, non_blocking=True)
+        tokens, grid_h, grid_w = model.extract_tokens(images)
+        tokens = l2n(tokens, dim=-1, eps=cfg.eps)
+        q_sem, valid_bp = boxes_to_soft_targets(boxes, grid_h, grid_w, cfg.image_size)
+
+        for p in range(model.parts):
+            valid_images = torch.where(valid_bp[:, p])[0]
+            for b in valid_images.tolist():
+                support = torch.where(q_sem[b, p] > 0)[0]
+                if support.numel():
+                    collected[p].append(tokens[b, support].detach().cpu())
+
+    for p, chunks in enumerate(collected):
+        if not chunks:
+            print(f"[Bootstrap] {cfg.parts[p]}: no valid semantic tokens; retaining random memory.")
+            continue
+        vectors = torch.cat(chunks, dim=0)
+        if vectors.shape[0] > cfg.bootstrap_max_tokens_per_part:
+            keep = torch.randperm(vectors.shape[0])[:cfg.bootstrap_max_tokens_per_part]
+            vectors = vectors[keep]
+        centers = run_kmeans(vectors.to(DEVICE), model.k, cfg.bootstrap_kmeans_iters)
+        model.memory[p].copy_(centers)
+        print(f"[Bootstrap] {cfg.parts[p]}: {vectors.shape[0]} tokens -> {model.k} centers.")
+
     model.train()
 
 
-# -----------------------------
-# Checkpointing
-# -----------------------------
-def save_checkpoint(path: str, model: nn.Module, optimizer: torch.optim.Optimizer, scaler: torch.cuda.amp.GradScaler, epoch: int, best_acc: float) -> None:
-    ensure_dir(os.path.dirname(path))
-    torch.save({
+# -----------------------------------------------------------------------------
+# Optimization, evaluation, and checkpoints
+# -----------------------------------------------------------------------------
+def build_optimizer(model: SharedPartPrototypeModel) -> torch.optim.Optimizer:
+    return torch.optim.AdamW(
+        [
+            {"params": list(model.backbone.parameters()), "lr": cfg.lr_backbone, "name": "backbone"},
+            {"params": [model.part_queries, model.null_logits], "lr": cfg.lr_router, "name": "router"},
+            {"params": [model.proto_residual], "lr": cfg.lr_proto, "name": "prototype"},
+            {
+                "params": [model.class_theta, model.class_bias],
+                "lr": cfg.lr_classifier,
+                "name": "classifier",
+            },
+        ],
+        weight_decay=cfg.weight_decay,
+        betas=(0.9, 0.999),
+    )
+
+
+@torch.no_grad()
+def evaluate(model: SharedPartPrototypeModel, loader: DataLoader) -> float:
+    model.eval()
+    correct = 0
+    total = 0
+    autocast_enabled = cfg.amp and DEVICE.type == "cuda"
+
+    for images, _, labels, _ in loader:
+        images = images.to(DEVICE, non_blocking=True)
+        labels = labels.to(DEVICE, non_blocking=True)
+        with torch.autocast(device_type=DEVICE.type, dtype=torch.float16, enabled=autocast_enabled):
+            logits = model(images)["logits"]
+        correct += int((logits.argmax(dim=1) == labels).sum().item())
+        total += int(labels.numel())
+    return correct / max(1, total)
+
+
+def resolve_resume_path() -> Optional[str]:
+    value = str(cfg.resume_from).strip()
+    if not cfg.resume or value.lower() in {"", "none", "no"}:
+        return None
+    if value == "last":
+        return os.path.join(cfg.save_dir, "last.pth")
+    if value == "best":
+        return os.path.join(cfg.save_dir, "best.pth")
+    return os.path.abspath(os.path.expanduser(value))
+
+
+def save_checkpoint(
+    path: str,
+    epoch: int,
+    best_acc: float,
+    model: SharedPartPrototypeModel,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+    scaler: Any,
+) -> None:
+    payload = {
         "epoch": epoch,
         "best_acc": best_acc,
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
-        "scaler": scaler.state_dict(),
-        "cfg": asdict(cfg),
-    }, path)
+        "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict() if scaler.is_enabled() else None,
+        "config": asdict(cfg),
+    }
+    tmp = path + ".tmp"
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
 
 
-def pick_resume_path(save_dir: str) -> Optional[str]:
-    if cfg.resume_from == "none" or not cfg.resume:
-        return None
-    name = "best.pth" if cfg.resume_from == "best" else "last.pth"
-    path = os.path.join(save_dir, name)
-    return path if os.path.isfile(path) else None
+def append_metrics(record: Dict[str, Any]) -> None:
+    path = os.path.join(cfg.save_dir, "metrics.jsonl")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
 
 
-# -----------------------------
-# CLI
-# -----------------------------
+# -----------------------------------------------------------------------------
+# Argument parsing and main
+# -----------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser("Shared part-prototype DINOv2 finetuning on CUB")
-    p.add_argument("--cub-root", default=os.environ.get("CUB_ROOT", cfg.cub_root))
-    p.add_argument("--gdino-box-dir", default=os.environ.get("GDINO_BOX_DIR", cfg.gdino_box_dir))
+    p = argparse.ArgumentParser("Part-gated shared prototype finetuning on CUB")
+
+    p.add_argument("--cub-root", default=cfg.cub_root)
+    p.add_argument("--gdino-box-dir", default=cfg.gdino_box_dir)
     p.add_argument("--gdino-train-file", default=cfg.gdino_train_file)
     p.add_argument("--gdino-test-file", default=cfg.gdino_test_file)
-    p.add_argument("--save-dir", default=os.environ.get("SAVE_DIR", cfg.save_dir))
+    p.add_argument("--save-dir", default=cfg.save_dir)
+
+    p.add_argument("--backbone", choices=["clip", "dino"], default=cfg.backbone)
+    p.add_argument("--clip-model", default=cfg.clip_model)
+    p.add_argument("--clip-init-checkpoint", default=cfg.clip_init_checkpoint)
     p.add_argument("--dino-model", default=cfg.dino_model)
     p.add_argument("--image-size", type=int, default=cfg.image_size)
-    p.add_argument("--parts", default=",".join(cfg.parts), help="Comma-separated parts.")
+
+    p.add_argument("--parts", default=",".join(cfg.parts))
     p.add_argument("--k-per-part", type=int, default=cfg.k_per_part)
-    p.add_argument("--score-mode", choices=["resp_sum", "scan_max", "scan_topk", "part_max", "part_topk"], default=cfg.score_mode)
-    p.add_argument("--score-scale", type=float, default=cfg.score_scale,
-                   help="Multiplies prototype evidence before the non-negative class readout. Useful for resp_sum.")
-    p.add_argument("--proto-dropout", type=float, default=cfg.proto_dropout,
-                   help="Dropout probability applied to proto_score before class readout during training only.")
-    p.add_argument("--scan-topk", type=int, default=cfg.scan_topk)
+    p.add_argument("--num-classes", type=int, default=cfg.num_classes)
+
     p.add_argument("--unfreeze-last-blocks", type=int, default=cfg.unfreeze_last_blocks)
+    p.add_argument("--unfreeze-norm", action=argparse.BooleanOptionalAction, default=cfg.unfreeze_norm)
     p.add_argument("--freeze-backbone-epochs", type=int, default=cfg.freeze_backbone_epochs)
-    p.add_argument("--no-unfreeze-norm", action="store_true")
-    p.add_argument("--epochs", type=int, default=cfg.epochs)
-    p.add_argument("--batch-size", type=int, default=cfg.batch_size)
-    p.add_argument("--max-train-batches", type=int, default=cfg.max_train_batches, help="Limit train batches per epoch; 0 means full epoch.")
-    p.add_argument("--num-workers", type=int, default=cfg.num_workers)
-    p.add_argument("--seed", type=int, default=cfg.seed)
-    p.add_argument("--lr-backbone", type=float, default=cfg.lr_backbone)
-    p.add_argument("--lr-router", type=float, default=cfg.lr_router)
-    p.add_argument("--lr-proto", type=float, default=cfg.lr_proto)
-    p.add_argument("--lr-classifier", type=float, default=cfg.lr_classifier)
-    p.add_argument("--weight-decay", type=float, default=cfg.weight_decay)
+
+    p.add_argument(
+        "--score-mode",
+        choices=["resp_sum", "scan_max", "scan_topk", "part_max", "part_topk"],
+        default=cfg.score_mode,
+    )
+    p.add_argument("--score-scale", type=float, default=cfg.score_scale)
+    p.add_argument("--scan-topk", type=int, default=cfg.scan_topk)
+    p.add_argument("--tau-part", type=float, default=cfg.tau_part)
+    p.add_argument("--tau-proto", type=float, default=cfg.tau_proto)
+    p.add_argument("--null-logit-init", type=float, default=cfg.null_logit_init)
+    p.add_argument("--residual-scale", type=float, default=cfg.residual_scale)
+    p.add_argument("--readout-mode", choices=["nonneg", "signed"], default=cfg.readout_mode)
+    p.add_argument("--class-theta-init", type=float, default=cfg.class_theta_init)
+    p.add_argument("--proto-dropout", type=float, default=cfg.proto_dropout)
+
     p.add_argument("--ema-rho", type=float, default=cfg.ema_rho)
     p.add_argument("--ema-sem-mix", type=float, default=cfg.ema_sem_mix)
+    p.add_argument("--ema-min-mass", type=float, default=cfg.ema_min_mass)
     p.add_argument("--ema-start-epoch", type=int, default=cfg.ema_start_epoch)
-    p.add_argument("--ema-stop-epoch", type=int, default=cfg.ema_stop_epoch,
-                   help="Stop EMA memory update after this epoch; 0 means never stop.")
-    p.add_argument("--residual-scale", type=float, default=cfg.residual_scale)
-    p.add_argument("--class-theta-init", type=float, default=cfg.class_theta_init)
-    p.add_argument("--readout-mode", choices=["nonneg", "signed"], default=cfg.readout_mode,
-                   help="Class readout: nonneg uses softplus weights; signed uses raw weights for positive/negative evidence.")
-    p.add_argument("--lambda-ce", type=float, default=cfg.lambda_ce,
-                   help="Cross-entropy loss weight.")
+    p.add_argument("--ema-stop-epoch", type=int, default=cfg.ema_stop_epoch)
+    p.add_argument("--ema-every-steps", type=int, default=cfg.ema_every_steps)
+
+    p.add_argument("--box-target-gaussian", action=argparse.BooleanOptionalAction, default=cfg.box_target_gaussian)
+    p.add_argument("--box-gaussian-sigma-scale", type=float, default=cfg.box_gaussian_sigma_scale)
+
+    p.add_argument("--label-smoothing", type=float, default=cfg.label_smoothing)
+    p.add_argument("--lambda-ce", type=float, default=cfg.lambda_ce)
     p.add_argument("--lambda-route", type=float, default=cfg.lambda_route)
     p.add_argument("--route-final-ratio", type=float, default=cfg.route_final_ratio)
     p.add_argument("--route-decay-epochs", type=int, default=cfg.route_decay_epochs)
     p.add_argument("--lambda-vis", type=float, default=cfg.lambda_vis)
     p.add_argument("--lambda-proto-lb", type=float, default=cfg.lambda_proto_lb)
-    p.add_argument("--lambda-proto-agree", type=float, default=cfg.lambda_proto_agree,
-                   help="Prototype-part agreement loss weight.")
-    p.add_argument("--proto-agree-direction", choices=["proto_to_part", "part_to_proto", "symmetric"],
-                   default=cfg.proto_agree_direction,
-                   help="Direction for prototype-part agreement loss.")
+    p.add_argument("--lambda-proto-agree", type=float, default=cfg.lambda_proto_agree)
+    p.add_argument(
+        "--proto-agree-direction",
+        choices=["part_to_proto", "proto_to_part", "symmetric"],
+        default=cfg.proto_agree_direction,
+    )
     p.add_argument("--lambda-proto-div", type=float, default=cfg.lambda_proto_div)
-    p.add_argument("--lambda-cls-sparse", type=float, default=cfg.lambda_cls_sparse,
-                   help="Sparsity penalty weight on class readout weights.")
-    p.add_argument("--label-smoothing", type=float, default=cfg.label_smoothing,
-                   help="Label smoothing for the cross-entropy loss.")
-    p.add_argument("--no-amp", action="store_true")
-    p.add_argument("--no-resume", action="store_true")
-    p.add_argument("--resume-from", choices=["last", "best", "none"], default=cfg.resume_from)
-    p.add_argument("--reset-optimizer-on-resume", action="store_true",
-                   help="Load model/best_acc from checkpoint but recreate optimizer/scaler so new LR/loss settings take effect.")
-    p.add_argument("--resume-class-theta-min", type=float, default=None,
-                   help="If set, clamp loaded class_theta to be at least this value, e.g. -1.0.")
+    p.add_argument("--proto-div-margin", type=float, default=cfg.proto_div_margin)
+    p.add_argument("--lambda-cls-sparse", type=float, default=cfg.lambda_cls_sparse)
+
+    p.add_argument("--lr-backbone", type=float, default=cfg.lr_backbone)
+    p.add_argument("--lr-router", type=float, default=cfg.lr_router)
+    p.add_argument("--lr-proto", type=float, default=cfg.lr_proto)
+    p.add_argument("--lr-classifier", type=float, default=cfg.lr_classifier)
+    p.add_argument("--weight-decay", type=float, default=cfg.weight_decay)
+    p.add_argument("--grad-clip", type=float, default=cfg.grad_clip)
+
+    p.add_argument("--epochs", type=int, default=cfg.epochs)
+    p.add_argument("--batch-size", type=int, default=cfg.batch_size)
+    p.add_argument("--max-train-batches", type=int, default=cfg.max_train_batches)
+    p.add_argument("--num-workers", type=int, default=cfg.num_workers)
+    p.add_argument("--seed", type=int, default=cfg.seed)
+    p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=cfg.amp)
+
+    p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=cfg.resume)
+    p.add_argument("--resume-from", default=cfg.resume_from)
+    p.add_argument("--reset-optimizer-on-resume", action="store_true")
+
     p.add_argument("--skip-bootstrap", action="store_true")
     p.add_argument("--bootstrap-batches", type=int, default=cfg.bootstrap_batches)
-    p.add_argument("--no-scan-purity", action="store_true")
-    p.add_argument("--no-train-debug", action="store_true")
-    p.add_argument("--debug-every", type=int, default=cfg.debug_every,
-                   help="Update tqdm debug postfix every N batches.")
+    p.add_argument("--bootstrap-max-tokens-per-part", type=int, default=cfg.bootstrap_max_tokens_per_part)
+    p.add_argument("--bootstrap-kmeans-iters", type=int, default=cfg.bootstrap_kmeans_iters)
+
+    p.add_argument("--eval-every", type=int, default=cfg.eval_every)
+    p.add_argument("--save-every", type=int, default=cfg.save_every)
+    p.add_argument("--log-train-debug", action=argparse.BooleanOptionalAction, default=cfg.log_train_debug)
+    p.add_argument("--debug-every", type=int, default=cfg.debug_every)
     return p.parse_args()
 
 
 def apply_args(args: argparse.Namespace) -> None:
-    cfg.cub_root = os.path.abspath(os.path.expanduser(args.cub_root))
-    cfg.gdino_box_dir = os.path.abspath(os.path.expanduser(args.gdino_box_dir))
-    cfg.gdino_train_file = args.gdino_train_file
-    cfg.gdino_test_file = args.gdino_test_file
-    cfg.save_dir = os.path.abspath(os.path.expanduser(args.save_dir))
-    cfg.dino_model = args.dino_model
-    cfg.image_size = args.image_size
-    cfg.parts = tuple([x.strip().lower() for x in args.parts.split(",") if x.strip()])
-    cfg.k_per_part = args.k_per_part
-    cfg.score_mode = args.score_mode
-    cfg.score_scale = args.score_scale
-    cfg.proto_dropout = args.proto_dropout
-    cfg.scan_topk = args.scan_topk
-    cfg.unfreeze_last_blocks = args.unfreeze_last_blocks
-    cfg.freeze_backbone_epochs = args.freeze_backbone_epochs
-    cfg.unfreeze_norm = not args.no_unfreeze_norm
-    cfg.epochs = args.epochs
-    cfg.batch_size = args.batch_size
-    cfg.max_train_batches = args.max_train_batches
-    cfg.num_workers = args.num_workers
-    cfg.seed = args.seed
-    cfg.lr_backbone = args.lr_backbone
-    cfg.lr_router = args.lr_router
-    cfg.lr_proto = args.lr_proto
-    cfg.lr_classifier = args.lr_classifier
-    cfg.weight_decay = args.weight_decay
-    cfg.ema_rho = args.ema_rho
-    cfg.ema_sem_mix = args.ema_sem_mix
-    cfg.ema_start_epoch = args.ema_start_epoch
-    cfg.ema_stop_epoch = args.ema_stop_epoch
-    cfg.residual_scale = args.residual_scale
-    cfg.class_theta_init = args.class_theta_init
-    cfg.readout_mode = args.readout_mode
-    cfg.lambda_ce = args.lambda_ce
-    cfg.lambda_route = args.lambda_route
-    cfg.route_final_ratio = args.route_final_ratio
-    cfg.route_decay_epochs = args.route_decay_epochs
-    cfg.lambda_vis = args.lambda_vis
-    cfg.lambda_proto_lb = args.lambda_proto_lb
-    cfg.lambda_proto_agree = args.lambda_proto_agree
-    cfg.proto_agree_direction = args.proto_agree_direction
-    cfg.lambda_proto_div = args.lambda_proto_div
-    cfg.lambda_cls_sparse = args.lambda_cls_sparse
-    cfg.label_smoothing = args.label_smoothing
-    cfg.amp = not args.no_amp
-    cfg.resume = not args.no_resume
-    cfg.resume_from = args.resume_from
-    cfg.reset_optimizer_on_resume = args.reset_optimizer_on_resume
-    cfg.resume_class_theta_min = args.resume_class_theta_min
-    cfg.bootstrap_memory = not args.skip_bootstrap
-    cfg.bootstrap_batches = args.bootstrap_batches
-    cfg.compute_scan_purity = not args.no_scan_purity
-    cfg.log_train_debug = not args.no_train_debug
-    cfg.debug_every = args.debug_every
+    global cfg
+    values = vars(args).copy()
+    parts = tuple(part.strip().lower() for part in values.pop("parts").split(",") if part.strip())
+    if not parts:
+        raise ValueError("--parts must contain at least one part name.")
+    values["parts"] = parts
+    values["bootstrap_memory"] = not bool(values.pop("skip_bootstrap"))
+
+    for key, value in values.items():
+        setattr(cfg, key, value)
+
+    cfg.cub_root = os.path.abspath(os.path.expanduser(cfg.cub_root))
+    cfg.gdino_box_dir = os.path.abspath(os.path.expanduser(cfg.gdino_box_dir))
+    cfg.save_dir = os.path.abspath(os.path.expanduser(cfg.save_dir))
+    init = str(cfg.clip_init_checkpoint).strip()
+    cfg.clip_init_checkpoint = (
+        "" if init.lower() in {"", "none", "no"} else os.path.abspath(os.path.expanduser(init))
+    )
 
 
 def preflight() -> None:
@@ -1340,236 +1157,233 @@ def preflight() -> None:
         os.path.join(cfg.cub_root, "image_class_labels.txt"),
         os.path.join(cfg.cub_root, "train_test_split.txt"),
         os.path.join(cfg.cub_root, "bounding_boxes.txt"),
-        os.path.join(cfg.cub_root, "images"),
         os.path.join(cfg.gdino_box_dir, cfg.gdino_train_file),
         os.path.join(cfg.gdino_box_dir, cfg.gdino_test_file),
     ]
-    missing = [x for x in required if not os.path.exists(x)]
+    if cfg.backbone == "clip" and cfg.clip_init_checkpoint:
+        required.append(cfg.clip_init_checkpoint)
+
+    missing = [path for path in required if not os.path.exists(path)]
     if missing:
-        raise FileNotFoundError("Missing required inputs:\n" + "\n".join(f"  - {x}" for x in missing))
+        raise FileNotFoundError("Missing required paths:\n" + "\n".join(missing))
 
 
-# -----------------------------
-# Main
-# -----------------------------
+def build_scaler(enabled: bool):
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
 def main() -> None:
     args = parse_args()
     apply_args(args)
     preflight()
     set_seed(cfg.seed)
+
+    if DEVICE.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+
     ensure_dir(cfg.save_dir)
-    with open(os.path.join(cfg.save_dir, "config.json"), "w", encoding="utf-8") as f:
-        json.dump(asdict(cfg), f, indent=2)
+    print("[Run] shared part-prototype finetuning")
+    print(
+        f"[Run] backbone={cfg.backbone}; "
+        f"{cfg.clip_model if cfg.backbone == 'clip' else cfg.dino_model}; "
+        f"parts={list(cfg.parts)}; K={cfg.k_per_part}; crop=official CUB bird bbox -> Resize({cfg.image_size})"
+    )
+    print(
+        f"[Run] score={cfg.score_mode}; readout={cfg.readout_mode}; "
+        f"lr=(backbone {cfg.lr_backbone:.1e}, router {cfg.lr_router:.1e}, "
+        f"proto {cfg.lr_proto:.1e}, classifier {cfg.lr_classifier:.1e})"
+    )
 
-    train_gdino = os.path.join(cfg.gdino_box_dir, cfg.gdino_train_file)
-    test_gdino = os.path.join(cfg.gdino_box_dir, cfg.gdino_test_file)
-    ds_train = CUBImageWithPartBoxes("train", train_gdino)
-    ds_test = CUBImageWithPartBoxes("test", test_gdino)
-    dl_train = make_loader(ds_train, train=True)
-    dl_test = make_loader(ds_test, train=False)
+    train_set = CUBImageWithPartBoxes(
+        "train", os.path.join(cfg.gdino_box_dir, cfg.gdino_train_file)
+    )
+    test_set = CUBImageWithPartBoxes(
+        "test", os.path.join(cfg.gdino_box_dir, cfg.gdino_test_file)
+    )
+    train_loader = make_loader(train_set, train=True)
+    test_loader = make_loader(test_set, train=False)
+    print(f"[Data] train={len(train_set)} test={len(test_set)} batch={cfg.batch_size}")
 
-    print(f"[Backbone] loading {cfg.dino_model}")
-    backbone = load_visual_backbone(cfg.dino_model).to(DEVICE)
-    n_trainable = set_dino_trainability(backbone, cfg.unfreeze_last_blocks, cfg.unfreeze_norm)
-    print(f"[DINO] trainable params after unfreeze={n_trainable:,}")
-
-    # Infer patch-token dimension with one small forward.
+    backbone = load_visual_backbone().to(DEVICE)
+    # Determine dimensions from the active visual tower rather than hard-coding.
     with torch.no_grad():
-        x0, _, _, _ = next(iter(DataLoader(ds_train, batch_size=1, shuffle=False, num_workers=0)))
-        x0 = x0.to(DEVICE)
-        x0_tokens, grid_h0, grid_w0 = extract_patch_tokens(backbone, x0)
-        dim = int(x0_tokens.shape[-1])
-        print(f"[Backbone] patch tokens={x0_tokens.shape[1]} grid={grid_h0}x{grid_w0} dim={dim}")
+        dummy = torch.zeros((1, 3, cfg.image_size, cfg.image_size), device=DEVICE)
+        tokens, grid_h, grid_w = extract_patch_tokens(backbone, dummy)
+    dim = tokens.shape[-1]
+    print(f"[Backbone] local tokens={tokens.shape[1]}, grid={grid_h}x{grid_w}, dim={dim}")
 
-    model = SharedPartPrototypeDINO(backbone, dim=dim, parts=len(cfg.parts), k=cfg.k_per_part, classes=cfg.num_classes).to(DEVICE)
+    model = SharedPartPrototypeModel(
+        backbone=backbone,
+        dim=dim,
+        parts=len(cfg.parts),
+        k=cfg.k_per_part,
+        classes=cfg.num_classes,
+    ).to(DEVICE)
 
+    target_unfreeze = cfg.unfreeze_last_blocks
     if cfg.freeze_backbone_epochs > 0:
-        set_dino_trainability(model.backbone, 0, False)
-        print(f"[DINO] backbone frozen for first {cfg.freeze_backbone_epochs} epochs")
+        trainable = set_backbone_trainability(model.backbone, 0, False)
+        print(f"[Backbone] frozen for first {cfg.freeze_backbone_epochs} epochs; trainable={trainable:,}")
+    else:
+        trainable = set_backbone_trainability(model.backbone, target_unfreeze, cfg.unfreeze_norm)
+        print(f"[Backbone] trainable params={trainable:,}")
 
-    optimizer = torch.optim.AdamW([
-        {"params": [p for p in model.backbone.parameters() if p.requires_grad], "lr": cfg.lr_backbone, "weight_decay": cfg.weight_decay},
-        {"params": [model.part_queries, model.null_logits], "lr": cfg.lr_router, "weight_decay": cfg.weight_decay},
-        {"params": [model.proto_residual], "lr": cfg.lr_proto, "weight_decay": cfg.weight_decay},
-        {"params": [model.class_theta, model.class_bias], "lr": cfg.lr_classifier, "weight_decay": 0.0},
-    ])
-    scaler = torch.cuda.amp.GradScaler(enabled=(cfg.amp and DEVICE == "cuda"))
+    if cfg.bootstrap_memory:
+        bootstrap_memory(model, train_loader)
+
+    optimizer = build_optimizer(model)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, cfg.epochs), eta_min=0.0
+    )
+    autocast_enabled = cfg.amp and DEVICE.type == "cuda"
+    scaler = build_scaler(autocast_enabled)
 
     start_epoch = 1
     best_acc = -1.0
-    resume_path = pick_resume_path(cfg.save_dir)
+    resume_path = resolve_resume_path()
     if resume_path:
-        ckpt = torch.load(resume_path, map_location="cpu")
-        model.load_state_dict(ckpt["model"], strict=True)
-        if cfg.resume_class_theta_min is not None:
-            with torch.no_grad():
-                model.class_theta.data.clamp_min_(float(cfg.resume_class_theta_min))
-            print(f"[Resume] clamped class_theta >= {float(cfg.resume_class_theta_min):.3f}")
+        if not os.path.isfile(resume_path):
+            raise FileNotFoundError(f"Requested resume checkpoint not found: {resume_path}")
+        checkpoint = safe_torch_load(resume_path, map_location="cpu")
+        model.load_state_dict(checkpoint["model"], strict=True)
+        best_acc = float(checkpoint.get("best_acc", -1.0))
+        start_epoch = int(checkpoint.get("epoch", 0)) + 1
         if not cfg.reset_optimizer_on_resume:
-            optimizer.load_state_dict(ckpt["optimizer"])
-            scaler.load_state_dict(ckpt.get("scaler", scaler.state_dict()))
-        else:
-            print("[Resume] reset optimizer/scaler; new CLI learning rates will be used")
-        start_epoch = int(ckpt.get("epoch", 0)) + 1
-        best_acc = float(ckpt.get("best_acc", -1.0))
-        print(f"[Resume] {resume_path} -> epoch {start_epoch}, best_acc={best_acc:.4f}")
-    elif cfg.bootstrap_memory:
-        bootstrap_memory_from_part_boxes(model, dl_train)
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            if "scheduler" in checkpoint:
+                scheduler.load_state_dict(checkpoint["scheduler"])
+            if checkpoint.get("scaler") is not None and scaler.is_enabled():
+                scaler.load_state_dict(checkpoint["scaler"])
+        print(f"[Resume] {resume_path}; next_epoch={start_epoch}; best={best_acc:.4f}")
 
-    print(f"[Data] train={len(ds_train)} test={len(ds_test)} parts={cfg.parts} K={cfg.k_per_part}")
-    print(f"[Train] device={DEVICE} amp={cfg.amp} score_mode={cfg.score_mode} readout_mode={cfg.readout_mode}")
-    log_path = os.path.join(cfg.save_dir, "history.jsonl")
-
-    global_step = 0
     for epoch in range(start_epoch, cfg.epochs + 1):
-        if epoch == cfg.freeze_backbone_epochs + 1 and cfg.freeze_backbone_epochs > 0:
-            set_dino_trainability(model.backbone, cfg.unfreeze_last_blocks, cfg.unfreeze_norm)
-            # Add newly trainable params by recreating optimizer; simpler and safe for first trial.
-            optimizer = torch.optim.AdamW([
-                {"params": [p for p in model.backbone.parameters() if p.requires_grad], "lr": cfg.lr_backbone, "weight_decay": cfg.weight_decay},
-                {"params": [model.part_queries, model.null_logits], "lr": cfg.lr_router, "weight_decay": cfg.weight_decay},
-                {"params": [model.proto_residual], "lr": cfg.lr_proto, "weight_decay": cfg.weight_decay},
-                {"params": [model.class_theta, model.class_bias], "lr": cfg.lr_classifier, "weight_decay": 0.0},
-            ])
-            print(f"[DINO] unfroze last {cfg.unfreeze_last_blocks} blocks at epoch {epoch}")
+        if cfg.freeze_backbone_epochs > 0 and epoch == cfg.freeze_backbone_epochs + 1:
+            trainable = set_backbone_trainability(
+                model.backbone, target_unfreeze, cfg.unfreeze_norm
+            )
+            print(f"[Backbone] unfroze last {target_unfreeze} blocks at epoch {epoch}; trainable={trainable:,}")
 
         model.train()
-        t0 = time.time()
-        lam_route = route_lambda(epoch)
-        totals = {"loss":0.0, "ce":0.0, "route":0.0, "vis":0.0, "agree":0.0, "lb":0.0, "div":0.0, "sparse":0.0, "correct":0, "count":0}
-        debug_totals: Dict[str, float] = {}
-        debug_count = 0
-        pbar = tqdm(dl_train, desc=f"Train {epoch}/{cfg.epochs}", ncols=160)
-        for batch_idx, (images, boxes, y, _) in enumerate(pbar, start=1):
-            if cfg.max_train_batches > 0 and batch_idx > cfg.max_train_batches:
-                break
-            images = images.to(DEVICE, non_blocking=True).float()
-            boxes = boxes.to(DEVICE, non_blocking=True).float()
-            y = y.to(DEVICE, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=(cfg.amp and DEVICE == "cuda")):
-                out = model(images)
-                h, w = int(out["grid_h"].item()), int(out["grid_w"].item())
-                q_sem, valid_bp = boxes_to_soft_q(boxes, h, w, cfg.image_size)
-                loss_ce = F.cross_entropy(out["logits"], y, label_smoothing=cfg.label_smoothing)
-                loss_route = semantic_route_loss(out["part_map"], q_sem, valid_bp)
-                loss_vis = visible_part_loss(out["visibility"], valid_bp)
-                loss_lb = semantic_proto_load_balance_loss(out["proto_assign"], q_sem, valid_bp)
-                loss_agree = prototype_part_agreement_loss(out["part_map"], out["proto_assign"], out["sim"], valid_bp)
-                loss_div = within_part_prototype_diversity_loss(out["prototypes"])
-                loss_sparse = classifier_sparsity_loss(out["class_weight"])
-                loss = (cfg.lambda_ce * loss_ce + lam_route * loss_route + cfg.lambda_vis * loss_vis
-                        + cfg.lambda_proto_agree * loss_agree + cfg.lambda_proto_lb * loss_lb
-                        + cfg.lambda_proto_div * loss_div + cfg.lambda_cls_sparse * loss_sparse)
+        if epoch <= cfg.freeze_backbone_epochs:
+            model.backbone.eval()
 
-            fwd_debug = compute_batch_debug_stats(out, valid_bp, y) if cfg.log_train_debug else {}
+        accum: Dict[str, float] = {}
+        seen = 0
+        correct = 0
+        started = time.time()
+        iterator = tqdm(train_loader, desc=f"Train {epoch}/{cfg.epochs}", dynamic_ncols=True)
+
+        for batch_index, (images, boxes, labels, _) in enumerate(iterator):
+            if cfg.max_train_batches > 0 and batch_index >= cfg.max_train_batches:
+                break
+
+            images = images.to(DEVICE, non_blocking=True)
+            boxes = boxes.to(DEVICE, non_blocking=True)
+            labels = labels.to(DEVICE, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=DEVICE.type, dtype=torch.float16, enabled=autocast_enabled):
+                output = model(images)
+                q_sem, valid_bp = boxes_to_soft_targets(
+                    boxes,
+                    int(output["grid_h"].item()),
+                    int(output["grid_w"].item()),
+                    cfg.image_size,
+                )
+                loss, stats = compute_losses(output, labels, q_sem, valid_bp, epoch)
+
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            grad_debug = {}
-            if cfg.log_train_debug:
-                grad_debug = {
-                    "grad_part_queries": grad_norm_of_tensors([model.part_queries]),
-                    "grad_null_logits": grad_norm_of_tensors([model.null_logits]),
-                    "grad_proto_residual": grad_norm_of_tensors([model.proto_residual]),
-                    "grad_class_theta": grad_norm_of_tensors([model.class_theta]),
-                    "grad_class_bias": grad_norm_of_tensors([model.class_bias]),
-                    "grad_backbone": grad_norm_of_tensors(p for p in model.backbone.parameters() if p.requires_grad),
-                }
-            total_grad = nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            if cfg.log_train_debug:
-                grad_debug["grad_total_preclip"] = _finite_float(total_grad)
+            if cfg.grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             scaler.step(optimizer)
             scaler.update()
-            ema_allowed = epoch >= cfg.ema_start_epoch
-            if cfg.ema_stop_epoch > 0:
-                ema_allowed = ema_allowed and epoch <= cfg.ema_stop_epoch
-            if ema_allowed and (global_step % max(1, cfg.ema_every_steps) == 0):
-                model.ema_update_memory(out["Xn"].detach(), out["part_map"].detach(), out["proto_assign"].detach(), q_sem.detach(), valid_bp.detach())
-            global_step += 1
 
-            bs = y.shape[0]
-            totals["count"] += bs
-            totals["correct"] += int((out["logits"].argmax(1) == y).sum().item())
-            for key, val in [("loss", loss), ("ce", loss_ce), ("route", loss_route), ("vis", loss_vis), ("agree", loss_agree), ("lb", loss_lb), ("div", loss_div), ("sparse", loss_sparse)]:
-                totals[key] += float(val.detach().item()) * bs
-
-            if cfg.log_train_debug:
-                batch_debug = dict(fwd_debug)
-                batch_debug.update(grad_debug)
-                add_weighted_stats(debug_totals, batch_debug, bs)
-                debug_count += bs
-
-            if batch_idx % max(1, cfg.debug_every) == 0 or batch_idx == 1:
-                pbar.set_postfix(
-                    acc=totals["correct"] / max(1, totals["count"]),
-                    loss=totals["loss"] / max(1, totals["count"]),
-                    ps=f"{fwd_debug.get('proto_score_mean', 0.0):.3g}" if cfg.log_train_debug else "na",
-                    lstd=f"{fwd_debug.get('logits_std', 0.0):.3g}" if cfg.log_train_debug else "na",
-                    gcls=f"{grad_debug.get('grad_class_theta', 0.0):.3g}" if cfg.log_train_debug else "na",
+            if (
+                epoch >= cfg.ema_start_epoch
+                and (cfg.ema_stop_epoch <= 0 or epoch <= cfg.ema_stop_epoch)
+                and (batch_index + 1) % max(1, cfg.ema_every_steps) == 0
+            ):
+                model.ema_update_memory(
+                    output["tokens"].detach(),
+                    output["part_map"].detach(),
+                    output["proto_assign"].detach(),
+                    q_sem.detach(),
+                    valid_bp.detach(),
                 )
 
-        n = max(1, totals["count"])
-        train_metrics = {k: (v / n if k not in {"correct", "count"} else v) for k, v in totals.items()}
-        train_metrics["acc"] = totals["correct"] / n
-        train_debug = {k: v / max(1, debug_count) for k, v in debug_totals.items()}
-        record: Dict[str, Any] = {"epoch": epoch, "time_sec": time.time() - t0, "train": train_metrics, "train_debug": train_debug}
+            n = int(labels.numel())
+            seen += n
+            correct += int((output["logits"].detach().argmax(dim=1) == labels).sum().item())
+            for key, value in stats.items():
+                accum[key] = accum.get(key, 0.0) + value * n
 
-        if epoch % cfg.eval_every == 0:
-            eval_metrics = compute_eval(model, dl_test, epoch)
-            record["eval"] = eval_metrics
-            acc = float(eval_metrics["acc"])
-            print(
-                f"[Epoch {epoch}] train_acc={train_metrics['acc']:.4f} eval_acc={acc:.4f} "
-                f"scan_purity={eval_metrics.get('scan_part_purity')} "
-                f"proto_mean={train_debug.get('proto_score_mean', 0.0):.3g} "
-                f"logits_std={train_debug.get('logits_std', 0.0):.3g} "
-                f"grad_cls={train_debug.get('grad_class_theta', 0.0):.3g}"
-            )
-            if acc > best_acc:
-                best_acc = acc
-                save_checkpoint(os.path.join(cfg.save_dir, "best.pth"), model, optimizer, scaler, epoch, best_acc)
-        else:
-            print(
-                f"[Epoch {epoch}] train_acc={train_metrics['acc']:.4f} "
-                f"proto_mean={train_debug.get('proto_score_mean', 0.0):.3g} "
-                f"logits_std={train_debug.get('logits_std', 0.0):.3g} "
-                f"grad_cls={train_debug.get('grad_class_theta', 0.0):.3g}"
+            iterator.set_postfix(
+                loss=f"{accum['loss'] / max(1, seen):.4f}",
+                acc=f"{correct / max(1, seen):.4f}",
+                vis=f"{accum.get('visibility', 0.0) / max(1, seen):.3f}",
             )
 
-        record["best_acc"] = best_acc
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+        scheduler.step()
+        train_stats = {key: value / max(1, seen) for key, value in accum.items()}
+        train_acc = correct / max(1, seen)
 
-        status = {
+        test_acc: Optional[float] = None
+        if epoch % max(1, cfg.eval_every) == 0 or epoch == cfg.epochs:
+            test_acc = evaluate(model, test_loader)
+
+        elapsed = time.time() - started
+        print(
+            f"[Epoch {epoch:03d}] train_loss={train_stats.get('loss', 0.0):.4f} "
+            f"train_acc={train_acc:.4f} "
+            f"test_acc={'-' if test_acc is None else f'{test_acc:.4f}'} "
+            f"route={train_stats.get('route', 0.0):.4f} "
+            f"agree={train_stats.get('proto_agree', 0.0):.4f} "
+            f"time={elapsed:.1f}s"
+        )
+
+        record: Dict[str, Any] = {
             "epoch": epoch,
-            "best_acc": best_acc,
-            "last_train_acc": float(train_metrics["acc"]),
-            "last_eval_acc": float(record["eval"]["acc"]) if "eval" in record else None,
-            "last_checkpoint": os.path.join(cfg.save_dir, "last.pth"),
-            "best_checkpoint": os.path.join(cfg.save_dir, "best.pth"),
-            "score_mode": cfg.score_mode,
-            "score_scale": cfg.score_scale,
-            "proto_dropout": cfg.proto_dropout,
-            "scan_topk": cfg.scan_topk,
-            "ema_stop_epoch": cfg.ema_stop_epoch,
-            "lambda_proto_lb": cfg.lambda_proto_lb,
-            "lambda_proto_agree": cfg.lambda_proto_agree,
-            "proto_agree_direction": cfg.proto_agree_direction,
-            "label_smoothing": cfg.label_smoothing,
-            "lambda_cls_sparse": cfg.lambda_cls_sparse,
-            "readout_mode": cfg.readout_mode,
-            "last_proto_score_mean": float(train_debug.get("proto_score_mean", 0.0)),
-            "last_logits_std": float(train_debug.get("logits_std", 0.0)),
-            "last_grad_class_theta": float(train_debug.get("grad_class_theta", 0.0)),
-            "last_valid_bp_ratio": float(train_debug.get("valid_bp_ratio", 0.0)),
+            "train_acc": train_acc,
+            "test_acc": test_acc,
+            "elapsed_sec": elapsed,
+            "lr_backbone": optimizer.param_groups[0]["lr"],
+            "lr_router": optimizer.param_groups[1]["lr"],
+            "lr_proto": optimizer.param_groups[2]["lr"],
+            "lr_classifier": optimizer.param_groups[3]["lr"],
+            **train_stats,
         }
-        with open(os.path.join(cfg.save_dir, "status.json"), "w", encoding="utf-8") as f:
-            json.dump(status, f, indent=2)
+        append_metrics(record)
 
-        if epoch % cfg.save_every == 0:
-            save_checkpoint(os.path.join(cfg.save_dir, "last.pth"), model, optimizer, scaler, epoch, best_acc)
+        if test_acc is not None and test_acc > best_acc:
+            best_acc = test_acc
+            save_checkpoint(
+                os.path.join(cfg.save_dir, "best.pth"),
+                epoch,
+                best_acc,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+            )
+            print(f"[Best] epoch={epoch} acc={best_acc:.4f}")
 
-    print(f"[Done] best_acc={best_acc:.4f}; save_dir={cfg.save_dir}")
+        if epoch % max(1, cfg.save_every) == 0 or epoch == cfg.epochs:
+            save_checkpoint(
+                os.path.join(cfg.save_dir, "last.pth"),
+                epoch,
+                best_acc,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+            )
+
+    print(f"[Done] best_test_acc={best_acc:.4f}")
 
 
 if __name__ == "__main__":
