@@ -81,7 +81,11 @@ class CFG:
     k_per_part: int = 50
 
     # Backbone adaptation.
+    # Partial mode: unfreeze the final N Transformer blocks (and optional norms).
+    # Full mode: unfreeze every visual-tower parameter, including patch and
+    # position embeddings; it overrides unfreeze_last_blocks.
     unfreeze_last_blocks: int = 2
+    full_finetune: bool = False
     unfreeze_norm: bool = True
     freeze_backbone_epochs: int = 30
 
@@ -874,7 +878,35 @@ def extract_patch_tokens(backbone: nn.Module, images: torch.Tensor) -> Tuple[tor
     return x.float(), side, side
 
 
-def set_backbone_trainability(backbone: nn.Module, last_blocks: int, unfreeze_norm: bool) -> int:
+def backbone_num_blocks(backbone: nn.Module) -> int:
+    """Return the number of Transformer blocks in the active visual tower."""
+    kind = str(getattr(backbone, "_proto_backbone_kind", ""))
+    if kind == "clip":
+        return len(list(backbone.vision_model.encoder.layers))
+    if kind in {"dino_v1", "dinov2"}:
+        return len(list(getattr(backbone, "blocks", [])))
+    raise ValueError(f"Unknown backbone kind: {kind}")
+
+
+def set_backbone_trainability(
+    backbone: nn.Module,
+    last_blocks: int,
+    unfreeze_norm: bool,
+    full_finetune: bool = False,
+) -> int:
+    """Select either final blocks or the entire visual tower for optimization."""
+    if full_finetune:
+        for parameter in backbone.parameters():
+            parameter.requires_grad_(True)
+        return sum(parameter.numel() for parameter in backbone.parameters() if parameter.requires_grad)
+
+    total_blocks = backbone_num_blocks(backbone)
+    if last_blocks < 0 or last_blocks > total_blocks:
+        raise ValueError(
+            f"--unfreeze-last-blocks must be in [0, {total_blocks}], got {last_blocks}. "
+            "Use --full-finetune to unfreeze the entire visual tower."
+        )
+
     for parameter in backbone.parameters():
         parameter.requires_grad_(False)
 
@@ -1333,7 +1365,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--k-per-part", type=int, default=cfg.k_per_part)
     p.add_argument("--num-classes", type=int, default=cfg.num_classes)
 
-    p.add_argument("--unfreeze-last-blocks", type=int, default=cfg.unfreeze_last_blocks)
+    p.add_argument(
+        "--unfreeze-last-blocks",
+        type=int,
+        default=cfg.unfreeze_last_blocks,
+        help="Partial finetune: unfreeze the final N Transformer blocks. For CLIP ViT-B/16, N is 0..12.",
+    )
+    p.add_argument(
+        "--full-finetune",
+        action=argparse.BooleanOptionalAction,
+        default=cfg.full_finetune,
+        help="Unfreeze the complete visual tower, including patch/position embeddings. Overrides --unfreeze-last-blocks.",
+    )
     p.add_argument("--unfreeze-norm", action=argparse.BooleanOptionalAction, default=cfg.unfreeze_norm)
     p.add_argument("--freeze-backbone-epochs", type=int, default=cfg.freeze_backbone_epochs)
 
@@ -1488,8 +1531,13 @@ def main() -> None:
         f"{cfg.clip_model if cfg.backbone == 'clip' else cfg.dino_model}; "
         f"parts={list(cfg.parts)}; K={cfg.k_per_part}; crop=official CUB bird bbox -> Resize({cfg.image_size})"
     )
+    finetune_desc = (
+        "full visual tower"
+        if cfg.full_finetune
+        else f"last {cfg.unfreeze_last_blocks} Transformer blocks"
+    )
     rank0_print(
-        f"[Run] score={cfg.score_mode}; readout={cfg.readout_mode}; "
+        f"[Run] finetune={finetune_desc}; score={cfg.score_mode}; readout={cfg.readout_mode}; "
         f"lr=(backbone {cfg.lr_backbone:.1e}, router {cfg.lr_router:.1e}, "
         f"proto {cfg.lr_proto:.1e}, classifier {cfg.lr_classifier:.1e})"
     )
@@ -1538,20 +1586,25 @@ def main() -> None:
     ).to(DEVICE)
 
     target_unfreeze = cfg.unfreeze_last_blocks
-    # Register candidate final-block parameters before DDP construction. This
-    # makes later unfreezing safe if --freeze-backbone-epochs is used.
     trainable = set_backbone_trainability(
-        core_model.backbone, target_unfreeze, cfg.unfreeze_norm
+        core_model.backbone,
+        target_unfreeze,
+        cfg.unfreeze_norm,
+        full_finetune=cfg.full_finetune,
     )
     if cfg.freeze_backbone_epochs > 0:
         for parameter in core_model.backbone.parameters():
             parameter.requires_grad_(False)
         rank0_print(
             f"[Backbone] frozen for first {cfg.freeze_backbone_epochs} epochs; "
-            f"candidate_unfrozen_params={trainable:,}"
+            f"candidate_trainable_params={trainable:,}; "
+            f"mode={'full' if cfg.full_finetune else f'last_{target_unfreeze}_blocks'}"
         )
     else:
-        rank0_print(f"[Backbone] trainable params={trainable:,}")
+        rank0_print(
+            f"[Backbone] trainable params={trainable:,}; "
+            f"mode={'full' if cfg.full_finetune else f'last_{target_unfreeze}_blocks'}"
+        )
 
     if cfg.bootstrap_memory:
         if is_distributed():
@@ -1613,11 +1666,14 @@ def main() -> None:
 
         if cfg.freeze_backbone_epochs > 0 and epoch == cfg.freeze_backbone_epochs + 1:
             trainable = set_backbone_trainability(
-                core_model.backbone, target_unfreeze, cfg.unfreeze_norm
+                core_model.backbone,
+                target_unfreeze,
+                cfg.unfreeze_norm,
+                full_finetune=cfg.full_finetune,
             )
             rank0_print(
-                f"[Backbone] unfroze last {target_unfreeze} blocks at epoch {epoch}; "
-                f"trainable={trainable:,}"
+                f"[Backbone] activated {'full visual tower' if cfg.full_finetune else f'last {target_unfreeze} blocks'} "
+                f"at epoch {epoch}; trainable={trainable:,}"
             )
 
         model.train()
