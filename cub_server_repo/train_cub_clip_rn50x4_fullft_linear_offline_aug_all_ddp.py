@@ -1,24 +1,17 @@
-"""Frozen OpenAI CLIP RN50x4 linear probe on CUB with saved NPPL crop augmentation.
+"""Full fine-tuning of OpenAI CLIP RN50x4 with a 200-way linear head on CUB.
 
 Training:
     every saved GT-bird crop and every saved NPPL augmentation -> direct Resize(288)
 Evaluation:
     raw CUB test image -> official GT bird bbox crop -> direct Resize(288)
 
-Only the new 200-way linear classifier is trained. The complete OpenAI CLIP
-RN50x4 model, including all BatchNorm running statistics, stays frozen in eval
-mode. The checkpoint stores the classifier only; the fixed RN50x4 encoder is
-reloaded from the OpenAI CLIP package on resume/evaluation.
+The complete RN50x4 visual tower, including its BatchNorm affine parameters and
+running statistics, is fine-tuned together with a new 200-way linear classifier.
+The text branch is intentionally not loaded into the trainable module. Under DDP,
+SyncBatchNorm is used by default so running statistics are synchronized across GPUs.
 
 Dependency (once, in the active environment):
-    pip install git+https://github.com/openai/CLIP.git
-
-Example:
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
-  train_cub_clip_rn50x4_frozen_linear_offline_aug_all_ddp.py \
-  --cub-root ./data/CUB_200_2011 \
-  --offline-aug-root ./data/cub200_cropped_nppl_bboxsync \
-  --save-dir ./runs/clip_rn50x4_frozen_linear_npplaug_all_resize288_8e
+    python -m pip install git+https://github.com/openai/CLIP.git
 """
 
 from __future__ import annotations
@@ -57,7 +50,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 @dataclass
 class Config:
     cub_root: str = "./data/CUB_200_2011"
-    save_dir: str = "./runs/clip_rn50x4_frozen_linear_npplaug_all_resize288_8e"
+    save_dir: str = "./runs/clip_rn50x4_fullft_linear_npplaug_all_resize288_8e"
     image_size: int = 288
     l2_normalize: bool = False
     clip_cache_dir: str = ""
@@ -70,13 +63,16 @@ class Config:
 
     epochs: int = 8
     warmup_source_epochs: float = 5.0
-    warmup_lr: float = 1e-5
+    warmup_lr: float = 1e-6
     min_lr_scale: float = 0.01
-    batch_size: int = 64  # per GPU under DDP
+    batch_size: int = 32  # per GPU under DDP; conservative for full RN50x4 fine-tuning
     num_workers: int = 8
+    lr_encoder: float = 1e-5
     lr_head: float = 1e-3
     weight_decay: float = 1e-4
     label_smoothing: float = 0.0
+    sync_bn: bool = True
+    grad_clip_norm: float = 1.0
     amp: bool = True
     seed: int = 42
     resume_from: str = "none"  # none | last | best | path
@@ -86,7 +82,7 @@ cfg = Config()
 
 
 def parse_args() -> Config:
-    p = argparse.ArgumentParser("Frozen OpenAI CLIP RN50x4 linear probe on CUB")
+    p = argparse.ArgumentParser("Full fine-tuning of OpenAI CLIP RN50x4 on CUB")
     p.add_argument("--cub-root", default=cfg.cub_root)
     p.add_argument("--save-dir", default=cfg.save_dir)
     p.add_argument("--image-size", type=int, default=cfg.image_size)
@@ -114,9 +110,12 @@ def parse_args() -> Config:
     p.add_argument("--min-lr-scale", type=float, default=cfg.min_lr_scale)
     p.add_argument("--batch-size", type=int, default=cfg.batch_size)
     p.add_argument("--num-workers", type=int, default=cfg.num_workers)
+    p.add_argument("--lr-encoder", type=float, default=cfg.lr_encoder)
     p.add_argument("--lr-head", type=float, default=cfg.lr_head)
     p.add_argument("--weight-decay", type=float, default=cfg.weight_decay)
     p.add_argument("--label-smoothing", type=float, default=cfg.label_smoothing)
+    p.add_argument("--sync-bn", action=argparse.BooleanOptionalAction, default=cfg.sync_bn)
+    p.add_argument("--grad-clip-norm", type=float, default=cfg.grad_clip_norm)
     p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=cfg.amp)
     p.add_argument("--seed", type=int, default=cfg.seed)
     p.add_argument("--resume-from", default=cfg.resume_from, help="none | last | best | path")
@@ -446,37 +445,32 @@ def prime_clip_cache() -> None:
     del model
 
 
-class FrozenCLIPRN50x4LinearClassifier(nn.Module):
-    """OpenAI CLIP RN50x4 image embedding followed by a trainable 200-way linear head."""
+class FullCLIPRN50x4LinearClassifier(nn.Module):
+    """Trainable OpenAI CLIP RN50x4 visual tower followed by a 200-way linear head."""
 
     def __init__(self, l2_normalize: bool):
         super().__init__()
         clip = _import_openai_clip()
-        kwargs = {"name": "RN50x4", "device": DEVICE, "jit": False}
+        # Load on CPU first. OpenAI CLIP otherwise converts its GPU weights to fp16;
+        # we keep a fp32 master model and use AMP for the forward/backward pass.
+        kwargs = {"name": "RN50x4", "device": "cpu", "jit": False}
         if cfg.clip_cache_dir:
             kwargs["download_root"] = cfg.clip_cache_dir
-        self.encoder, _ = clip.load(**kwargs)
+        clip_model, _ = clip.load(**kwargs)
+        clip_model = clip_model.float()
 
-        if not hasattr(self.encoder, "visual") or not hasattr(self.encoder.visual, "output_dim"):
-            raise RuntimeError("Loaded CLIP model does not expose a visual output_dim required for the linear probe.")
-        self.expected_image_size = int(self.encoder.visual.input_resolution)
-        feature_dim = int(self.encoder.visual.output_dim)
+        if not hasattr(clip_model, "visual") or not hasattr(clip_model.visual, "output_dim"):
+            raise RuntimeError("Loaded CLIP model does not expose the RN50x4 visual output dimension.")
+        self.visual = clip_model.visual
+        del clip_model  # exclude the unused text branch from DDP and the optimizer
+
+        self.expected_image_size = int(self.visual.input_resolution)
+        feature_dim = int(self.visual.output_dim)
         self.l2_normalize = bool(l2_normalize)
         self.head = nn.Linear(feature_dim, NUM_CLASSES)
 
-        for parameter in self.encoder.parameters():
-            parameter.requires_grad_(False)
-        self.encoder.eval()
-
-    def train(self, mode: bool = True):
-        super().train(mode)
-        # Preserve frozen BatchNorm running statistics in CLIP ModifiedResNet.
-        self.encoder.eval()
-        return self
-
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            features = self.encoder.encode_image(images)
+        features = self.visual(images)
         features = features.float()
         if self.l2_normalize:
             features = F.normalize(features, dim=-1, eps=1e-8)
@@ -488,8 +482,12 @@ def unwrap(model: nn.Module) -> nn.Module:
 
 
 def build_optimizer(model: nn.Module) -> torch.optim.Optimizer:
+    base = unwrap(model)
     return torch.optim.AdamW(
-        [{"params": unwrap(model).head.parameters(), "lr": cfg.lr_head, "name": "head"}],
+        [
+            {"params": base.visual.parameters(), "lr": cfg.lr_encoder, "name": "encoder"},
+            {"params": base.head.parameters(), "lr": cfg.lr_head, "name": "head"},
+        ],
         weight_decay=cfg.weight_decay,
         betas=(0.9, 0.999),
     )
@@ -504,10 +502,17 @@ def cosine_lr(base_lr: float, step: int, total_steps: int, warmup_steps: int) ->
     return base_lr * (cfg.min_lr_scale + (1.0 - cfg.min_lr_scale) * cosine)
 
 
-def set_step_lr(optimizer: torch.optim.Optimizer, step: int, total_steps: int, warmup_steps: int) -> float:
+def set_step_lrs(
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    total_steps: int,
+    warmup_steps: int,
+) -> Tuple[float, float]:
+    enc_lr = cosine_lr(cfg.lr_encoder, step, total_steps, warmup_steps)
     head_lr = cosine_lr(cfg.lr_head, step, total_steps, warmup_steps)
-    optimizer.param_groups[0]["lr"] = head_lr
-    return head_lr
+    optimizer.param_groups[0]["lr"] = enc_lr
+    optimizer.param_groups[1]["lr"] = head_lr
+    return enc_lr, head_lr
 
 
 def reduce_values(*values: float) -> List[float]:
@@ -562,11 +567,11 @@ def save_checkpoint(
     payload = {
         "epoch": epoch,
         "best_acc": best_acc,
-        "head": unwrap(model).head.state_dict(),
+        "model": unwrap(model).state_dict(),
         "optimizer": optimizer.state_dict(),
         "scaler": scaler_state_dict(scaler),
         "config": asdict(cfg),
-        "encoder": "OpenAI CLIP RN50x4 (frozen)",
+        "encoder": "OpenAI CLIP RN50x4 visual tower (full fine-tuning)",
     }
     tmp_path = path + ".tmp"
     torch.save(payload, tmp_path)
@@ -593,14 +598,14 @@ def main() -> None:
         os.makedirs(cfg.save_dir, exist_ok=True)
     barrier()
 
-    rank0_print("[Run] frozen OpenAI CLIP RN50x4 + 200-way linear head")
+    rank0_print("[Run] full fine-tuning OpenAI CLIP RN50x4 visual tower + 200-way linear head")
     rank0_print(
         f"[Run] image_size={cfg.image_size}; l2_normalize={cfg.l2_normalize}; "
-        f"global_batch={cfg.batch_size * WORLD_SIZE}; encoder=frozen"
+        f"global_batch={cfg.batch_size * WORLD_SIZE}; encoder=full-finetune; sync_bn={cfg.sync_bn}"
     )
     rank0_print(
-        f"[Run] lr_head={cfg.lr_head:.2e}; warmup_source_epochs={cfg.warmup_source_epochs:g}@{cfg.warmup_lr:.2e}; "
-        f"epochs={cfg.epochs}"
+        f"[Run] lr_encoder={cfg.lr_encoder:.2e}; lr_head={cfg.lr_head:.2e}; "
+        f"warmup_source_epochs={cfg.warmup_source_epochs:g}@{cfg.warmup_lr:.2e}; epochs={cfg.epochs}"
     )
 
     # Rank 0 downloads/caches the model once before all ranks instantiate it.
@@ -608,7 +613,7 @@ def main() -> None:
     barrier()
 
     train_loader, test_loader, train_sampler, train_dataset = build_loaders()
-    model: nn.Module = FrozenCLIPRN50x4LinearClassifier(cfg.l2_normalize).to(DEVICE)
+    model: nn.Module = FullCLIPRN50x4LinearClassifier(cfg.l2_normalize).to(DEVICE)
     if cfg.image_size != unwrap(model).expected_image_size:
         raise ValueError(
             f"RN50x4 expects image_size={unwrap(model).expected_image_size}, but got {cfg.image_size}. "
@@ -616,8 +621,14 @@ def main() -> None:
         )
 
     feature_dim = unwrap(model).head.in_features
-    rank0_print(f"[Model] RN50x4 visual embedding_dim={feature_dim}; all encoder parameters and BN statistics frozen")
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    rank0_print(
+        f"[Model] RN50x4 visual embedding_dim={feature_dim}; trainable_params={trainable:,}; "
+        f"BatchNorm={'SyncBatchNorm' if (distributed() and cfg.sync_bn) else 'local BatchNorm'}"
+    )
 
+    if distributed() and cfg.sync_bn:
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model).to(DEVICE)
     if distributed():
         model = DDP(
             model,
@@ -654,7 +665,7 @@ def main() -> None:
             checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
         except TypeError:
             checkpoint = torch.load(resume_path, map_location="cpu")
-        unwrap(model).head.load_state_dict(checkpoint["head"], strict=True)
+        unwrap(model).load_state_dict(checkpoint["model"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
         if checkpoint.get("scaler") is not None and scaler.is_enabled():
             scaler.load_state_dict(checkpoint["scaler"])
@@ -678,7 +689,7 @@ def main() -> None:
 
         for batch_idx, (images, labels) in enumerate(iterator):
             global_step = (epoch - 1) * steps_per_epoch + batch_idx
-            head_lr = set_step_lr(optimizer, global_step, total_steps, warmup_steps)
+            enc_lr, head_lr = set_step_lrs(optimizer, global_step, total_steps, warmup_steps)
             images = images.to(DEVICE, non_blocking=True)
             labels = labels.to(DEVICE, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
@@ -688,6 +699,9 @@ def main() -> None:
                 loss = criterion(logits, labels)
 
             scaler.scale(loss).backward()
+            if cfg.grad_clip_norm > 0.0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip_norm)
             scaler.step(optimizer)
             scaler.update()
 
@@ -700,6 +714,7 @@ def main() -> None:
                 iterator.set_postfix(
                     loss=f"{running_loss / max(1.0, running_total):.4f}",
                     acc=f"{running_correct / max(1.0, running_total):.4f}",
+                    enc_lr=f"{enc_lr:.1e}",
                     head_lr=f"{head_lr:.1e}",
                 )
 
@@ -713,7 +728,7 @@ def main() -> None:
         if main_process():
             print(
                 f"[Epoch {epoch:03d}] train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
-                f"test_acc={test_acc:.4f} head_lr={head_lr:.3e}"
+                f"test_acc={test_acc:.4f} enc_lr={enc_lr:.3e} head_lr={head_lr:.3e}"
             )
 
         if test_acc > best_acc:
