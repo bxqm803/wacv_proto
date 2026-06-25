@@ -1,4 +1,4 @@
-"""Shared part-prototype finetuning on Stanford Dogs with OpenAI CLIP ResNet backbones.
+"""Shared part-prototype finetuning on TesNet-augmented Stanford Dogs with OpenAI CLIP RN50 OS16.
 
 This is the CLIP ResNet counterpart of the ViT/DINO part-prototype pipeline. It preserves
 part routing, part-specific prototype banks, responsibility-weighted evidence,
@@ -12,8 +12,7 @@ Only the local-feature adapter changes:
           -> existing part-prototype pipeline
 
 Supported backbones:
-  --clip-resnet RN50   (native input 224, layer4 grid 7x7)
-  --clip-resnet RN50x4 (native input 288, layer4 grid 9x9)
+  --clip-resnet RN50 (native input 224, modified layer4 grid 14x14 via stride removal)
 
 The AttentionPool2d module is intentionally excluded, because this model uses
 spatial layer4 features rather than CLIP's final global image embedding.
@@ -55,19 +54,22 @@ DEFAULT_PARTS = ("head", "ear", "muzzle", "body", "leg", "tail")
 @dataclass
 class CFG:
     dogs_root: str = "./data/StanfordDogs"
+    train_aug_root: str = "./data/stanforddogs_tesnet_aug_bboxsync"
+    train_aug_manifest_file: str = "train_tesnet_aug_manifest.pt"
     gdino_box_dir: str = "./artifacts/hf_gdino_stanforddogs_6parts"
     gdino_train_file: str = "train_part_boxes_hf_gdino.pt"
     gdino_test_file: str = "test_part_boxes_hf_gdino.pt"
-    save_dir: str = "./runs/stanforddogs_shared_part_proto_cliprn50x4"
+    save_dir: str = "./runs/stanforddogs_shared_6parts_k50_cliprn50_os16_tesnetaug"
 
     # Visual backbone. The implementation accepts the OpenAI CLIP
     # ModifiedResNet variants that expose a layer4 spatial feature map.
     backbone: str = "clip_resnet"
-    clip_resnet: str = "RN50x4"  # RN50 | RN50x4
+    clip_resnet: str = "RN50"  # This OS16 script is intended for standard OpenAI CLIP RN50.
     clip_init_checkpoint: str = ""
-    image_size: int = 288  # RN50=224, RN50x4=288; validated against the model.
+    image_size: int = 224
     clip_cache_dir: str = ""
     sync_bn: bool = True
+    layer4_os16: bool = True  # Remove layer4 stride-2 downsampling: 7x7 -> 14x14 at 224.
 
 
     num_classes: int = 120
@@ -81,7 +83,7 @@ class CFG:
     unfreeze_last_blocks: int = 2
     full_finetune: bool = False
     unfreeze_norm: bool = True
-    freeze_backbone_epochs: int = 30
+    freeze_backbone_epochs: int = 7
 
     # Prototype scoring.
     score_mode: str = "resp_sum"
@@ -491,6 +493,220 @@ class StanfordDogsWithPartBoxes(Dataset):
         )
 
 
+# -----------------------------------------------------------------------------
+# Offline TesNet-style train augmentation dataset
+# -----------------------------------------------------------------------------
+def load_tesnet_aug_manifest(path: str) -> Dict[str, Any]:
+    payload = safe_torch_load(path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(f"Augmentation manifest must be a dict: {path}")
+
+    required = ("meta", "variants", "source_rel_annotations", "source_labels", "box_shards")
+    missing = [key for key in required if key not in payload]
+    if missing:
+        raise KeyError(f"Augmentation manifest missing keys {missing}: {path}")
+    return payload
+
+
+def augmented_image_relative_path(rel_annotation: str, variant: Dict[str, Any]) -> str:
+    parent, stem = os.path.split(rel_annotation)
+    family = str(variant.get("family", ""))
+    name = str(variant.get("name", ""))
+    if family == "original":
+        return os.path.join("train_cropped", parent, stem + ".jpg")
+    return os.path.join("train_cropped_augmented", parent, f"{stem}_{name}.jpg")
+
+
+def tensor_to_int_list(value: Any) -> List[int]:
+    if isinstance(value, torch.Tensor):
+        return [int(x) for x in value.detach().cpu().reshape(-1).tolist()]
+    return [int(x) for x in np.asarray(value).reshape(-1).tolist()]
+
+
+def load_tesnet_augmented_boxes(
+    manifest: Dict[str, Any],
+    aug_root: str,
+) -> torch.Tensor:
+    """Load all shard boxes into [N, V, P, M, 4] in manifest source order."""
+    meta = manifest["meta"]
+    source_rel = [str(x) for x in manifest["source_rel_annotations"]]
+    variants = manifest["variants"]
+    part_names = [str(x).lower() for x in meta.get("parts", [])]
+    if tuple(part_names) != tuple(cfg.parts):
+        raise ValueError(
+            f"Augmentation manifest parts={part_names}, but requested --parts={list(cfg.parts)}."
+        )
+
+    n_sources = len(source_rel)
+    n_variants = len(variants)
+    expected_max_boxes = int(meta.get("max_boxes", 0))
+    shard_paths = [os.path.join(aug_root, str(path)) for path in manifest["box_shards"]]
+    if not shard_paths:
+        raise RuntimeError("Augmentation manifest declares no box shards.")
+
+    loaded_chunks: List[torch.Tensor] = []
+    expected_start = 0
+    max_boxes: Optional[int] = None
+
+    for shard_path in shard_paths:
+        if not os.path.isfile(shard_path):
+            raise FileNotFoundError(f"Missing augmentation box shard: {shard_path}")
+        shard = safe_torch_load(shard_path, map_location="cpu")
+        if not isinstance(shard, dict) or not isinstance(shard.get("boxes_xyxy_resize"), torch.Tensor):
+            raise TypeError(f"Invalid augmentation box shard: {shard_path}")
+
+        source_start = int(shard.get("source_start", -1))
+        source_end = int(shard.get("source_end", -1))
+        boxes = shard["boxes_xyxy_resize"].float().contiguous()
+
+        if source_start != expected_start:
+            raise RuntimeError(
+                f"Shard order gap/overlap at {shard_path}: expected start={expected_start}, got={source_start}."
+            )
+        if source_end <= source_start or boxes.shape[0] != source_end - source_start:
+            raise RuntimeError(f"Invalid source span in augmentation shard: {shard_path}")
+        if boxes.ndim != 5 or boxes.shape[1] != n_variants or boxes.shape[2] != len(cfg.parts) or boxes.shape[-1] != 4:
+            raise RuntimeError(
+                f"Unexpected shard box shape {tuple(boxes.shape)} in {shard_path}; "
+                f"expected [N,{n_variants},{len(cfg.parts)},M,4]."
+            )
+
+        if max_boxes is None:
+            max_boxes = int(boxes.shape[3])
+        elif int(boxes.shape[3]) != max_boxes:
+            raise RuntimeError(f"Inconsistent max-box dimension across shards at {shard_path}.")
+
+        shard_rel = [str(x) for x in shard.get("source_rel_annotations", [])]
+        if shard_rel and shard_rel != source_rel[source_start:source_end]:
+            raise RuntimeError(f"Source ordering mismatch in augmentation shard: {shard_path}")
+
+        loaded_chunks.append(boxes)
+        expected_start = source_end
+
+    if expected_start != n_sources:
+        raise RuntimeError(
+            f"Augmentation shards cover {expected_start} sources, manifest declares {n_sources}."
+        )
+
+    all_boxes = torch.cat(loaded_chunks, dim=0).contiguous()
+    if expected_max_boxes > 0 and int(all_boxes.shape[3]) != expected_max_boxes:
+        raise RuntimeError(
+            f"Manifest max_boxes={expected_max_boxes}, loaded max_boxes={all_boxes.shape[3]}."
+        )
+    return all_boxes
+
+
+class StanfordDogsTesNetAugmented(Dataset):
+    """All offline TesNet-style train images with their per-variant weak boxes.
+
+    For nonlinear skew/distortion variants, the builder stores -1 for all boxes.
+    `boxes_to_soft_targets` treats those parts as invalid, so no routing, visibility,
+    prototype-agreement, or semantic-EMA supervision is applied to them.
+    """
+
+    def __init__(self, aug_root: str, manifest_file: str, only_original: bool = False):
+        self.aug_root = os.path.abspath(aug_root)
+        manifest_path = os.path.join(self.aug_root, manifest_file)
+        self.manifest = load_tesnet_aug_manifest(manifest_path)
+        self.variants: List[Dict[str, Any]] = [dict(item) for item in self.manifest["variants"]]
+        self.source_rel_annotations = [str(item) for item in self.manifest["source_rel_annotations"]]
+        self.source_labels = tensor_to_int_list(self.manifest["source_labels"])
+
+        if len(self.source_rel_annotations) != len(self.source_labels):
+            raise RuntimeError(
+                f"Augmentation manifest has {len(self.source_rel_annotations)} sources but "
+                f"{len(self.source_labels)} labels."
+            )
+        if not self.variants:
+            raise RuntimeError("Augmentation manifest contains no variants.")
+
+        meta = self.manifest["meta"]
+        manifest_size = int(meta.get("image_size", cfg.image_size))
+        if manifest_size != cfg.image_size:
+            raise ValueError(
+                f"Augmentation images are {manifest_size}x{manifest_size}; "
+                f"requested --image-size={cfg.image_size}."
+            )
+
+        self.boxes = load_tesnet_augmented_boxes(self.manifest, self.aug_root)
+        if self.boxes.shape[0] != len(self.source_rel_annotations):
+            raise RuntimeError("Augmented box tensor / manifest source count mismatch.")
+
+        if only_original:
+            self.variant_indices = [
+                index for index, variant in enumerate(self.variants)
+                if str(variant.get("family", "")) == "original"
+            ]
+        else:
+            self.variant_indices = list(range(len(self.variants)))
+
+        if not self.variant_indices:
+            raise RuntimeError("No selected augmentation variants.")
+
+        self.transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize(*input_normalization()),
+            ]
+        )
+
+        valid = (
+            (self.boxes[..., 0] >= 0)
+            & (self.boxes[..., 2] > self.boxes[..., 0])
+            & (self.boxes[..., 3] > self.boxes[..., 1])
+        )
+        selected_valid = valid[:, self.variant_indices]
+        supervised_parts = selected_valid.any(dim=-1).float().mean().item()
+        nonlinear_indices = [
+            idx for idx, variant in enumerate(self.variants)
+            if str(variant.get("family", "")) in {"skew", "distortion"}
+        ]
+        if nonlinear_indices:
+            nonlinear_valid = valid[:, nonlinear_indices].any(dim=-1).any().item()
+            if nonlinear_valid:
+                raise RuntimeError(
+                    "Nonlinear skew/distortion variants unexpectedly contain valid weak boxes. "
+                    "Rebuild the augmentation cache before training."
+                )
+
+        rank0_print(
+            f"[AugData] manifest={os.path.basename(manifest_path)}; sources={len(self.source_rel_annotations)}; "
+            f"selected_variants={len(self.variant_indices)}/{len(self.variants)}; "
+            f"train_samples={len(self):,}; max_boxes={self.boxes.shape[3]}; "
+            f"supervised_part_ratio={supervised_parts:.4f}; only_original={only_original}"
+        )
+
+    def __len__(self) -> int:
+        return len(self.source_rel_annotations) * len(self.variant_indices)
+
+    def __getitem__(self, index: int):
+        variants_per_source = len(self.variant_indices)
+        source_index = int(index) // variants_per_source
+        variant_index = self.variant_indices[int(index) % variants_per_source]
+
+        rel_annotation = self.source_rel_annotations[source_index]
+        variant = self.variants[variant_index]
+        image_path = os.path.join(
+            self.aug_root,
+            augmented_image_relative_path(rel_annotation, variant),
+        )
+
+        with Image.open(image_path) as image:
+            image = image.convert("RGB")
+        if image.size != (cfg.image_size, cfg.image_size):
+            raise RuntimeError(
+                f"Offline augmented image must already be {cfg.image_size}x{cfg.image_size}, "
+                f"got {image.size}: {image_path}"
+            )
+
+        return (
+            self.transform(image),
+            self.boxes[source_index, variant_index],
+            int(self.source_labels[source_index]),
+            f"{rel_annotation}::{variant.get('name', variant_index)}",
+        )
+
+
 class DistributedEvalSampler(Sampler[int]):
     """Shard evaluation without padding/duplicating samples across DDP ranks."""
 
@@ -747,9 +963,43 @@ def load_clip_resnet_checkpoint(backbone: nn.Module, checkpoint_path: str) -> No
     )
 
 
+
+def enable_layer4_os16(backbone: nn.Module) -> None:
+    """Remove the final layer4 stride-2 reduction in OpenAI CLIP ModifiedResNet.
+
+    CLIP RN50 at 224 produces a 7x7 layer4 map. Its first layer4 Bottleneck uses
+    AvgPool2d(stride=2) in both residual branches. Replacing both pools with
+    Identity preserves the pretrained convolutions and changes only the sampling
+    stride, yielding the desired 14x14 local-token grid.
+    """
+    if not hasattr(backbone, "layer4") or len(backbone.layer4) < 1:
+        raise RuntimeError("CLIP spatial backbone has no valid layer4 stage.")
+
+    first_block = backbone.layer4[0]
+    if not hasattr(first_block, "avgpool"):
+        raise RuntimeError("Unexpected CLIP Bottleneck: missing avgpool in layer4[0].")
+    first_block.avgpool = nn.Identity()
+
+    downsample = getattr(first_block, "downsample", None)
+    if downsample is None:
+        raise RuntimeError("Unexpected CLIP Bottleneck: missing downsample in layer4[0].")
+
+    replaced = False
+    if isinstance(downsample, nn.Sequential):
+        for name, module in list(downsample._modules.items()):
+            if isinstance(module, (nn.AvgPool2d, nn.MaxPool2d)):
+                downsample._modules[name] = nn.Identity()
+                replaced = True
+                break
+    if not replaced:
+        raise RuntimeError(
+            "Could not find the stride-reduction pool in CLIP layer4[0].downsample."
+        )
+
+
 def load_visual_backbone() -> nn.Module:
-    if cfg.clip_resnet not in {"RN50", "RN50x4"}:
-        raise ValueError(f"--clip-resnet must be RN50 or RN50x4, got {cfg.clip_resnet!r}")
+    if cfg.clip_resnet != "RN50":
+        raise ValueError(f"This OS16 augmentation script is restricted to --clip-resnet RN50, got {cfg.clip_resnet!r}")
 
     clip = _import_openai_clip()
     kwargs: Dict[str, Any] = {"name": cfg.clip_resnet, "device": "cpu", "jit": False}
@@ -762,6 +1012,8 @@ def load_visual_backbone() -> nn.Module:
 
     model = CLIPModifiedResNetSpatial(clip_model.visual)
     del clip_model  # do not retain the unused CLIP text branch or AttentionPool2d.
+    if cfg.layer4_os16:
+        enable_layer4_os16(model)
     load_clip_resnet_checkpoint(model, cfg.clip_init_checkpoint)
     return model
 
@@ -1229,16 +1481,19 @@ def parse_args() -> argparse.Namespace:
     )
 
     p.add_argument("--dogs-root", default=cfg.dogs_root)
+    p.add_argument("--train-aug-root", default=cfg.train_aug_root)
+    p.add_argument("--train-aug-manifest-file", default=cfg.train_aug_manifest_file)
     p.add_argument("--gdino-box-dir", default=cfg.gdino_box_dir)
     p.add_argument("--gdino-train-file", default=cfg.gdino_train_file)
     p.add_argument("--gdino-test-file", default=cfg.gdino_test_file)
     p.add_argument("--save-dir", default=cfg.save_dir)
 
-    p.add_argument("--clip-resnet", choices=["RN50", "RN50x4"], default=cfg.clip_resnet)
+    p.add_argument("--clip-resnet", choices=["RN50"], default=cfg.clip_resnet)
     p.add_argument("--clip-init-checkpoint", default=cfg.clip_init_checkpoint)
     p.add_argument("--clip-cache-dir", default=cfg.clip_cache_dir)
     p.add_argument("--image-size", type=int, default=cfg.image_size)
     p.add_argument("--sync-bn", action=argparse.BooleanOptionalAction, default=cfg.sync_bn)
+    p.add_argument("--layer4-os16", action=argparse.BooleanOptionalAction, default=cfg.layer4_os16)
 
     p.add_argument("--parts", default=",".join(cfg.parts))
     p.add_argument("--k-per-part", type=int, default=cfg.k_per_part)
@@ -1340,6 +1595,7 @@ def apply_args(args: argparse.Namespace) -> None:
         setattr(cfg, key, value)
 
     cfg.dogs_root = os.path.abspath(os.path.expanduser(cfg.dogs_root))
+    cfg.train_aug_root = os.path.abspath(os.path.expanduser(cfg.train_aug_root))
     cfg.gdino_box_dir = os.path.abspath(os.path.expanduser(cfg.gdino_box_dir))
     cfg.save_dir = os.path.abspath(os.path.expanduser(cfg.save_dir))
     init = str(cfg.clip_init_checkpoint).strip()
@@ -1352,9 +1608,8 @@ def preflight() -> None:
     required = [
         os.path.join(cfg.dogs_root, "Images"),
         os.path.join(cfg.dogs_root, "Annotation"),
-        os.path.join(cfg.dogs_root, "train_list.mat"),
         os.path.join(cfg.dogs_root, "test_list.mat"),
-        os.path.join(cfg.gdino_box_dir, cfg.gdino_train_file),
+        os.path.join(cfg.train_aug_root, cfg.train_aug_manifest_file),
         os.path.join(cfg.gdino_box_dir, cfg.gdino_test_file),
     ]
     if cfg.clip_init_checkpoint:
@@ -1387,14 +1642,15 @@ def main() -> None:
         ensure_dir(cfg.save_dir)
     barrier()
 
-    rank0_print("[Run] Stanford Dogs shared part-prototype finetuning with OpenAI CLIP ResNet spatial tokens")
+    rank0_print("[Run] Stanford Dogs shared part-prototype finetuning with TesNet augmentation and CLIP RN50 OS16 tokens")
     rank0_print(
         f"[Run] world_size={WORLD_SIZE}; per_gpu_batch={cfg.batch_size}; "
         f"global_batch={cfg.batch_size * WORLD_SIZE}"
     )
     rank0_print(
         f"[Run] backbone={cfg.clip_resnet}; local features=layer4 before AttentionPool2d; "
-        f"parts={list(cfg.parts)}; K={cfg.k_per_part}; crop=official Stanford Dogs dog bbox -> Resize({cfg.image_size})"
+        f"layer4_os16={cfg.layer4_os16}; parts={list(cfg.parts)}; K={cfg.k_per_part}; "
+        f"train=offline TesNet augmentation at {cfg.image_size}; test=official dog bbox crop -> Resize({cfg.image_size})"
     )
     finetune_desc = (
         "full ResNet spatial tower"
@@ -1410,17 +1666,27 @@ def main() -> None:
     prime_clip_cache()
     barrier()
 
-    train_set = StanfordDogsWithPartBoxes(
-        "train", os.path.join(cfg.gdino_box_dir, cfg.gdino_train_file)
+    train_set = StanfordDogsTesNetAugmented(
+        cfg.train_aug_root,
+        cfg.train_aug_manifest_file,
+        only_original=False,
     )
+    bootstrap_set = None
+    if cfg.bootstrap_memory:
+        bootstrap_set = StanfordDogsTesNetAugmented(
+            cfg.train_aug_root,
+            cfg.train_aug_manifest_file,
+            only_original=True,
+        )
     test_set = StanfordDogsWithPartBoxes(
         "test", os.path.join(cfg.gdino_box_dir, cfg.gdino_test_file)
     )
     train_loader = make_loader(train_set, train=True)
     test_loader = make_loader(test_set, train=False)
     rank0_print(
-        f"[Data] train={len(train_set)} test={len(test_set)} batch={cfg.batch_size}; "
-        "training uses original official dog crops only (no offline augmentation)."
+        f"[Data] train_augmented={len(train_set):,} "
+        f"test={len(test_set):,} batch={cfg.batch_size}; "
+        "rotation/shear retain synchronized weak boxes; skew/distortion carry invalid boxes only."
     )
 
     backbone = load_visual_backbone().to(DEVICE)
@@ -1428,13 +1694,18 @@ def main() -> None:
     if cfg.image_size != expected_image_size:
         raise ValueError(
             f"{cfg.clip_resnet} expects native image_size={expected_image_size}, but got {cfg.image_size}. "
-            "Use --image-size 224 for RN50 or --image-size 288 for RN50x4."
+            "Use --image-size 224 for CLIP RN50 in this OS16 script."
         )
     # Determine local feature dimensions from the active spatial tower rather than hard-coding.
     with torch.no_grad():
         dummy = torch.zeros((1, 3, cfg.image_size, cfg.image_size), device=DEVICE)
         tokens, grid_h, grid_w = extract_patch_tokens(backbone, dummy)
     dim = tokens.shape[-1]
+    expected_grid = 14 if (cfg.clip_resnet == "RN50" and cfg.image_size == 224 and cfg.layer4_os16) else None
+    if expected_grid is not None and (grid_h, grid_w) != (expected_grid, expected_grid):
+        raise RuntimeError(
+            f"RN50 OS16 expected a {expected_grid}x{expected_grid} layer4 grid, got {grid_h}x{grid_w}."
+        )
     rank0_print(f"[Backbone] local tokens={tokens.shape[1]}, grid={grid_h}x{grid_w}, dim={dim}")
 
     core_model = SharedPartPrototypeModel(
@@ -1474,7 +1745,7 @@ def main() -> None:
         if is_distributed():
             if is_main_process():
                 bootstrap_loader = DataLoader(
-                    train_set,
+                    bootstrap_set,
                     batch_size=cfg.batch_size,
                     shuffle=False,
                     num_workers=cfg.num_workers,
@@ -1486,7 +1757,10 @@ def main() -> None:
             dist.broadcast(core_model.memory, src=0)
             barrier()
         else:
-            bootstrap_memory(core_model, train_loader)
+            if bootstrap_set is None:
+                raise RuntimeError("Bootstrap dataset was not constructed.")
+            bootstrap_loader = make_loader(bootstrap_set, train=True)
+            bootstrap_memory(core_model, bootstrap_loader)
 
     if is_distributed():
         model: nn.Module = DDP(
