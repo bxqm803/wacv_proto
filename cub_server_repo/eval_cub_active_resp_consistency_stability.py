@@ -1,31 +1,28 @@
 #!/usr/bin/env python3
 """
-Evaluate Consistency (Con.) and Stability (Stb.) for the shared part-prototype
-CUB model using its local resp evidence map and CUB's official keypoint labels.
+Activation-conditioned Consistency (Con.) and Stability (Stb.) for the shared
+part-prototype CUB model using local resp evidence maps and CUB official
+keypoint labels.
 
-Protocol:
-  resp[b,p,n,k] = responsibility[b,p,n,k] * relu(sim[b,p,n,k])
-  proto_score_raw[b,p,k] = sum_n resp[b,p,n,k]
+For each image i and shared prototype j=(p,k), define the unscaled resp_sum
+evidence
+    e_{i,j} = sum_n responsibility_{i,p,n,k} * ReLU(sim_{i,p,n,k}).
 
-A shared prototype (p,k) is assigned to its owner class
-argmax_c class_weight[c,p,k], matching the class-conditioned evaluation domain
-used by class-specific ProtoPNet metrics. Its spatial map remains raw resp:
-the owner weight is used only to select the evaluation images and is NOT
-multiplied into the map.
+Only image-prototype pairs with e_{i,j} > --resp-threshold are evaluated.
+This avoids localizing arbitrary peaks for prototypes that are not used by an
+image. No owner-class assignment is imposed because prototypes are shared.
 
 Con:
-  A prototype is consistent if any official CUB keypoint is covered by its
-  72x72 peak region (half_size=36) on at least 80% of owner-class test images
-  where that keypoint is visible.
+  For each prototype, among its activated test images, a CUB keypoint is
+  consistent when its peak-centered 72x72 region is covered on at least 80%
+  of the activated images where that keypoint is visible.
 
 Stb:
-  On each owner-class image, compare the 15D keypoint-coverage vectors from
-  the original image and a normalized-space Gaussian-noise perturbation.
-  The prototype score is the fraction of identical vectors; Stb averages it
-  over all 300 prototypes.
+  For the same activation-selected image-prototype pairs, compare original and
+  Gaussian-noise perturbed 15D keypoint-coverage vectors.
 
-Expected training source:
-  train_cub_shared_part_proto_finetune_reg_vitb16_ddp.py
+This is an activation-conditioned adaptation of EvalProtoPNet's Con/Stb
+protocol, not the unfiltered class-conditioned protocol.
 """
 
 from __future__ import annotations
@@ -220,23 +217,29 @@ class CUBOfficialKeypointTest(Dataset):
 
 
 @torch.inference_mode()
-def response_coverage(
+def response_outputs(
     model: torch.nn.Module,
     images: torch.Tensor,
     keypoints: torch.Tensor,
     image_size: int,
     half_size: int,
     amp: bool,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Returns bool [B, P*K, Q].
-    Each map is the local resp summand, upsampled to image_size then localized
-    by its maximum, following the official EvalProtoPNet metric convention.
+    Returns:
+      coverage: bool [B, P*K, Q]
+      resp_score: float [B, P*K], where score=sum_n responsibility*ReLU(sim).
+
+    The spatial map is the same local summand used by resp_sum.
     """
     device_type = images.device.type
     autocast_enabled = bool(amp and device_type == "cuda")
 
-    with torch.autocast(device_type=device_type, dtype=torch.float16, enabled=autocast_enabled):
+    with torch.autocast(
+        device_type=device_type,
+        dtype=torch.float16,
+        enabled=autocast_enabled,
+    ):
         out = model(images)
 
     sim = out.get("sim", out.get("similarity"))
@@ -244,11 +247,15 @@ def response_coverage(
         raise KeyError("Model output lacks both 'sim' and 'similarity'.")
     responsibility = out["responsibility"]
 
-    # The exact spatial summand used by resp_sum:
-    # proto_score_raw = sum_n responsibility * relu(sim)
+    # Exact local resp summand used by score_mode=resp_sum.
     resp = responsibility.float() * F.relu(sim.float())  # [B,P,N,K]
-
     bsz, n_parts, n_tokens, k_per_part = resp.shape
+    m_count = n_parts * k_per_part
+
+    # The unscaled aggregate response used to decide whether a prototype was
+    # activated on this image.
+    resp_score = resp.sum(dim=2).reshape(bsz, m_count)  # [B,P*K]
+
     grid_h = int(out["grid_h"].item())
     grid_w = int(out["grid_w"].item())
     if n_tokens != grid_h * grid_w:
@@ -258,11 +265,9 @@ def response_coverage(
 
     maps = (
         resp.permute(0, 1, 3, 2)
-        .reshape(bsz * n_parts * k_per_part, 1, grid_h, grid_w)
+        .reshape(bsz * m_count, 1, grid_h, grid_w)
         .contiguous()
     )
-
-    # B=4 gives 1,200 maps for P=6,K=50: safe on a 40GB A100.
     upsampled = F.interpolate(
         maps,
         size=(image_size, image_size),
@@ -271,8 +276,8 @@ def response_coverage(
     )
     flat_idx = upsampled.flatten(1).argmax(dim=1)
 
-    peak_y = (flat_idx // image_size).view(bsz, n_parts * k_per_part)
-    peak_x = (flat_idx % image_size).view(bsz, n_parts * k_per_part)
+    peak_y = (flat_idx // image_size).view(bsz, m_count)
+    peak_x = (flat_idx % image_size).view(bsz, m_count)
 
     x = keypoints[..., 0].unsqueeze(1)  # [B,1,Q]
     y = keypoints[..., 1].unsqueeze(1)
@@ -282,9 +287,8 @@ def response_coverage(
     y1 = (peak_y - int(half_size)).unsqueeze(-1)
     y2 = (peak_y + int(half_size)).clamp_max(image_size).unsqueeze(-1)
 
-    # Keypoints are invalid (-1,-1) when invisible; visibility masking is
-    # applied by the caller for Con and owner-class conditioning.
-    return (x >= x1) & (x <= x2) & (y >= y1) & (y <= y2)
+    coverage = (x >= x1) & (x <= x2) & (y >= y1) & (y <= y2)
+    return coverage, resp_score
 
 
 def load_model(train_module, checkpoint: Dict[str, Any], device: torch.device):
@@ -397,6 +401,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--part-thresh", type=float, default=0.80)
     p.add_argument("--noise-std", type=float, default=0.20)
     p.add_argument("--noise-clip", type=float, default=0.25)
+    p.add_argument(
+        "--resp-threshold",
+        type=float,
+        default=0.05,
+        help="Evaluate a prototype only where its unscaled resp_sum score is above this value.",
+    )
+    p.add_argument(
+        "--min-active-images",
+        type=int,
+        default=1,
+        help="A prototype needs at least this many activation-selected test images to enter macro averages.",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     return p.parse_args()
@@ -451,38 +467,34 @@ def main() -> None:
     if m_count != 300:
         print(f"[Warning] evaluating {m_count} prototypes, not 300.")
 
-    # Shared-prototype adaptation:
-    # assign prototype (p,k) to the class where its nonnegative readout weight
-    # is maximal; this supplies the class-specific image set used by the
-    # original Con/Stb protocol.
-    owner_class = model.class_weights().detach().float().argmax(dim=0).reshape(-1).to(device)
-
-    class_names = read_text_map(os.path.join(args.cub_root, "classes.txt"))
     part_names = [dataset.part_names[i + 1] for i in range(dataset.num_parts)]
 
+    # All test images are considered. A prototype contributes only on image i
+    # if its unscaled aggregated response e_{i,p,k} exceeds resp_threshold.
     hit_count = torch.zeros((m_count, dataset.num_parts), dtype=torch.long)
     visible_count = torch.zeros((m_count, dataset.num_parts), dtype=torch.long)
     stable_count = torch.zeros((m_count,), dtype=torch.long)
-    eval_count = torch.zeros((m_count,), dtype=torch.long)
+    active_count = torch.zeros((m_count,), dtype=torch.long)
+    noise_active_count = torch.zeros((m_count,), dtype=torch.long)
 
     print(
         f"[Eval] test_images={len(dataset)} | image_size={image_size} | "
-        f"grid from model output | P={p_count}, K={k_count} | "
-        f"half_size={args.half_size}, part_thresh={args.part_thresh}"
+        f"P={p_count}, K={k_count} | half_size={args.half_size}, "
+        f"part_thresh={args.part_thresh}"
     )
     print(
-        "[Eval] spatial map = responsibility * ReLU(sim); "
-        "class weight only selects the owner class."
+        f"[Eval] activation-conditioned selection: "
+        f"sum_n(resp) > {args.resp_threshold:.6g}; "
+        "spatial map = responsibility * ReLU(sim)."
     )
 
-    progress = tqdm(loader, desc="Con/Stb (resp)", dynamic_ncols=True)
-    for images, labels, keypoints, visible, _image_ids in progress:
+    progress = tqdm(loader, desc="Con/Stb (active resp)", dynamic_ncols=True)
+    for images, _labels, keypoints, visible, _image_ids in progress:
         images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
         keypoints = keypoints.to(device, non_blocking=True)
         visible = visible.to(device, non_blocking=True)
 
-        coverage = response_coverage(
+        coverage, resp_score = response_outputs(
             model=model,
             images=images,
             keypoints=keypoints,
@@ -491,10 +503,14 @@ def main() -> None:
             amp=args.amp,
         )
 
-        # Noise is applied in normalized tensor space exactly as in EvalProtoPNet.
+        # Selection is defined from the original image response. If the same
+        # prototype becomes inactive after perturbation, its changed peak map
+        # remains part of Stb and can lower the stability score.
+        active_mask = resp_score.gt(float(args.resp_threshold))  # [B,M]
+
         noise = torch.randn_like(images) * float(args.noise_std)
         noise = noise.clamp(min=-float(args.noise_clip), max=float(args.noise_clip))
-        coverage_noise = response_coverage(
+        coverage_noise, resp_score_noise = response_outputs(
             model=model,
             images=images + noise,
             keypoints=keypoints,
@@ -502,32 +518,46 @@ def main() -> None:
             half_size=args.half_size,
             amp=args.amp,
         )
+        noise_active_mask = resp_score_noise.gt(float(args.resp_threshold))
 
-        # [B,M] selects images from each shared prototype's owner class.
-        owner_mask = labels[:, None].eq(owner_class[None, :])
-        valid = owner_mask[:, :, None] & visible[:, None, :]
-
+        valid = active_mask[:, :, None] & visible[:, None, :]
         visible_count += valid.sum(dim=0).cpu().long()
         hit_count += (coverage & valid).sum(dim=0).cpu().long()
 
         same_coverage = coverage.eq(coverage_noise).all(dim=-1)  # [B,M]
-        stable_count += (same_coverage & owner_mask).sum(dim=0).cpu().long()
-        eval_count += owner_mask.sum(dim=0).cpu().long()
+        stable_count += (same_coverage & active_mask).sum(dim=0).cpu().long()
+        active_count += active_mask.sum(dim=0).cpu().long()
+        noise_active_count += (noise_active_mask & active_mask).sum(dim=0).cpu().long()
 
     denom = visible_count.clamp_min(1).float()
     per_part_ratio = hit_count.float() / denom
     dominant_ratio, dominant_part = per_part_ratio.max(dim=1)
     consistent = dominant_ratio.ge(float(args.part_thresh))
-    per_proto_stability = stable_count.float() / eval_count.clamp_min(1).float()
+    per_proto_stability = stable_count.float() / active_count.clamp_min(1).float()
+    noise_retention = noise_active_count.float() / active_count.clamp_min(1).float()
 
-    con = float(consistent.float().mean().item() * 100.0)
-    stb = float(per_proto_stability.mean().item() * 100.0)
+    eligible = active_count.ge(int(args.min_active_images))
+    n_eligible = int(eligible.sum().item())
+    if n_eligible == 0:
+        raise RuntimeError(
+            "No prototype has enough active test images. Lower --resp-threshold "
+            "or --min-active-images."
+        )
 
-    print(f"\nConsistency (Con.): {con:.2f}%")
-    print(f"Stability   (Stb.): {stb:.2f}%")
+    con = float(consistent[eligible].float().mean().item() * 100.0)
+    stb = float(per_proto_stability[eligible].mean().item() * 100.0)
+    mean_active = float(active_count[eligible].float().mean().item())
+    median_active = float(active_count[eligible].float().median().item())
 
-    owner_cpu = owner_class.cpu().tolist()
-    csv_path = output_dir / "per_prototype_resp_con_stb.csv"
+    print(f"\nActivation-conditioned Consistency (Con.): {con:.2f}%")
+    print(f"Activation-conditioned Stability   (Stb.): {stb:.2f}%")
+    print(
+        f"Eligible prototypes: {n_eligible}/{m_count} | "
+        f"active images/prototype: mean={mean_active:.2f}, "
+        f"median={median_active:.1f}"
+    )
+
+    csv_path = output_dir / "per_prototype_active_resp_con_stb.csv"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(
@@ -535,13 +565,13 @@ def main() -> None:
                 "prototype_id",
                 "part_group",
                 "within_part_k",
-                "owner_class_id_1based",
-                "owner_class_name",
+                "active_test_images",
+                "eligible_for_macro",
+                "noise_resp_retention",
                 "dominant_gt_keypoint",
                 "consistency_ratio",
                 "consistent_at_threshold",
                 "stability",
-                "owner_test_images",
             ]
             + [f"ratio_{name}" for name in part_names]
         )
@@ -549,18 +579,17 @@ def main() -> None:
         for flat_id in range(m_count):
             p = flat_id // k_count
             k = flat_id % k_count
-            owner = int(owner_cpu[flat_id])
             row = [
                 flat_id,
                 parts[p],
                 k,
-                owner + 1,
-                class_names.get(owner + 1, str(owner + 1)),
+                int(active_count[flat_id].item()),
+                int(eligible[flat_id].item()),
+                float(noise_retention[flat_id].item()),
                 part_names[int(dominant_part[flat_id].item())],
                 float(dominant_ratio[flat_id].item()),
                 int(consistent[flat_id].item()),
                 float(per_proto_stability[flat_id].item()),
-                int(eval_count[flat_id].item()),
             ]
             row += [float(v) for v in per_part_ratio[flat_id].tolist()]
             writer.writerow(row)
@@ -568,9 +597,14 @@ def main() -> None:
     summary = {
         "checkpoint": os.path.abspath(args.checkpoint),
         "train_script": os.path.abspath(args.train_script),
+        "metric_name": "activation-conditioned Con/Stb",
         "resp_definition": "responsibility * ReLU(sim)",
-        "shared_prototype_domain": "owner class = argmax_c class_weight[c,p,k]",
+        "activation_score": "sum_n responsibility * ReLU(sim)",
+        "activation_domain": "all CUB test images; no owner-class restriction",
+        "resp_threshold": float(args.resp_threshold),
+        "min_active_images": int(args.min_active_images),
         "num_prototypes": m_count,
+        "eligible_prototypes": n_eligible,
         "num_test_images": len(dataset),
         "image_size": image_size,
         "half_size": int(args.half_size),
@@ -580,13 +614,15 @@ def main() -> None:
         "seed": int(args.seed),
         "consistency_percent": con,
         "stability_percent": stb,
+        "mean_active_images_per_eligible_prototype": mean_active,
+        "median_active_images_per_eligible_prototype": median_active,
         "per_prototype_csv": str(csv_path),
     }
-    with open(output_dir / "summary_resp_con_stb.json", "w", encoding="utf-8") as f:
+    with open(output_dir / "summary_active_resp_con_stb.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
     print(f"[Saved] {csv_path}")
-    print(f"[Saved] {output_dir / 'summary_resp_con_stb.json'}")
+    print(f"[Saved] {output_dir / 'summary_active_resp_con_stb.json'}")
 
 
 if __name__ == "__main__":
