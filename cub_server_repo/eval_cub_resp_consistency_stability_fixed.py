@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib.util
+import inspect
 import json
 import math
 import os
@@ -291,23 +292,57 @@ def load_model(train_module, checkpoint: Dict[str, Any], device: torch.device):
     if not isinstance(saved_cfg, dict):
         raise TypeError("Checkpoint must contain a dict under 'cfg' or 'config'.")
 
-    # Reconstruct the original model configuration.
+    # Reconstruct the exact training-time configuration saved in the checkpoint.
     for key, value in saved_cfg.items():
         if hasattr(train_module.cfg, key):
             setattr(train_module.cfg, key, value)
 
-    # Use single-process evaluator device.
+    # Single-process evaluator device.
     train_module.DEVICE = device
 
     if not hasattr(train_module, "load_visual_backbone"):
         raise AttributeError("Training script lacks load_visual_backbone().")
-    if not hasattr(train_module, "SharedPartPrototypeDINO"):
+    if not hasattr(train_module, "extract_patch_tokens"):
+        raise AttributeError("Training script lacks extract_patch_tokens().")
+
+    # The current CUB script names the model SharedPartPrototypeModel;
+    # older variants used SharedPartPrototypeDINO. Support both names.
+    model_cls = getattr(train_module, "SharedPartPrototypeModel", None)
+    if model_cls is None:
+        model_cls = getattr(train_module, "SharedPartPrototypeDINO", None)
+    if model_cls is None:
         raise AttributeError(
-            "This evaluator expects SharedPartPrototypeDINO in the training script."
+            "Could not find SharedPartPrototypeModel or SharedPartPrototypeDINO "
+            "in the supplied training script."
         )
 
-    backbone = train_module.load_visual_backbone(train_module.cfg.dino_model).to(device)
-    backbone.eval()
+    # Newer scripts build the visual backbone from cfg with no positional
+    # arguments; older scripts require cfg.dino_model.
+    loader = train_module.load_visual_backbone
+    signature = inspect.signature(loader)
+    required_positional = [
+        p for p in signature.parameters.values()
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                      inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        and p.default is inspect.Parameter.empty
+    ]
+    if len(required_positional) == 0:
+        backbone = loader()
+    elif len(required_positional) == 1:
+        dino_model = getattr(train_module.cfg, "dino_model", None)
+        if dino_model is None:
+            raise AttributeError(
+                "load_visual_backbone() requires a model name, but cfg.dino_model "
+                "is unavailable in this training script."
+            )
+        backbone = loader(dino_model)
+    else:
+        raise TypeError(
+            "Unsupported load_visual_backbone() signature: "
+            f"{signature}"
+        )
+
+    backbone = backbone.to(device).eval()
 
     with torch.no_grad():
         dummy = torch.zeros(
@@ -316,7 +351,7 @@ def load_model(train_module, checkpoint: Dict[str, Any], device: torch.device):
         )
         tokens, _, _ = train_module.extract_patch_tokens(backbone, dummy)
 
-    model = train_module.SharedPartPrototypeDINO(
+    model = model_cls(
         backbone=backbone,
         dim=int(tokens.shape[-1]),
         parts=len(train_module.cfg.parts),
@@ -327,10 +362,14 @@ def load_model(train_module, checkpoint: Dict[str, Any], device: torch.device):
     raw_state = checkpoint.get("model", checkpoint)
     if not isinstance(raw_state, dict):
         raise TypeError("Checkpoint model state is not a dict.")
-    missing, unexpected = model.load_state_dict(normalize_state_dict(raw_state), strict=False)
+
+    missing, unexpected = model.load_state_dict(
+        normalize_state_dict(raw_state),
+        strict=False,
+    )
     if missing or unexpected:
         raise RuntimeError(
-            "Checkpoint/model mismatch.\n"
+            "Checkpoint/model mismatch after rebuilding the exact training architecture.\n"
             f"Missing ({len(missing)}): {missing[:12]}\n"
             f"Unexpected ({len(unexpected)}): {unexpected[:12]}"
         )
